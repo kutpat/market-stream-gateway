@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod catalog;
 pub mod domain;
 pub mod protocol;
 pub mod providers;
