@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod domain;
+pub mod history;
 pub mod protocol;
 pub mod providers;
 
