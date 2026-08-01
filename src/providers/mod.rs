@@ -8,8 +8,10 @@ use uuid::Uuid;
 use crate::domain::{Channel, Provider, ProviderEvent, SubscriptionKey};
 
 pub mod binance;
+pub mod bingx;
 pub mod bybit;
 pub mod kucoin;
+pub mod mexc;
 pub mod okx;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -64,6 +66,7 @@ pub struct OutboundCommand {
 pub enum ParsedFrame {
     Events(Vec<ProviderEvent>),
     Acknowledgement { request_id: String },
+    Reply(Heartbeat),
     Pong,
     Ignored,
 }

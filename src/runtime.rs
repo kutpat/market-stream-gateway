@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::pending;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -288,9 +289,22 @@ async fn run_connection(
                 } = command;
                 send_message(&mut writer, Message::Text(text.into())).await?;
                 commands.mark_sent(request_id, expected_acknowledgements)?;
-                acknowledgement_deadline = Some(
-                    Instant::now() + target.subscription_ack_timeout,
-                );
+                if expected_acknowledgements > 0 {
+                    acknowledgement_deadline = Some(
+                        Instant::now() + target.subscription_ack_timeout,
+                    );
+                }
+                if commands.readiness_complete() {
+                    acknowledgement_deadline = None;
+                    mark_live(
+                        provider,
+                        endpoint,
+                        connection_epoch,
+                        desired.len(),
+                        context,
+                    );
+                    live = true;
+                }
                 if idle_after_commands && !commands.has_queued() {
                     let _ = send_message(&mut writer, Message::Close(None)).await;
                     return Ok(ConnectionExit::Idle);
@@ -348,46 +362,59 @@ async fn run_connection(
                             provider,
                             endpoint,
                         )?;
-                        if handle_processed_frame(
-                            processed,
-                            &mut commands,
-                            &mut live,
-                            &mut acknowledgement_deadline,
-                            target.subscription_ack_timeout,
-                            provider,
-                            endpoint,
-                            connection_epoch,
-                            desired.len(),
-                            context,
-                        )? {
-                            last_market_event = Instant::now();
+                        match processed {
+                            ProcessedFrame::Reply(reply) => {
+                                send_heartbeat(&mut writer, reply).await?;
+                            }
+                            processed => {
+                                if handle_processed_frame(
+                                    processed,
+                                    &mut commands,
+                                    &mut live,
+                                    &mut acknowledgement_deadline,
+                                    target.subscription_ack_timeout,
+                                    provider,
+                                    endpoint,
+                                    connection_epoch,
+                                    desired.len(),
+                                    context,
+                                )? {
+                                    last_market_event = Instant::now();
+                                }
+                            }
                         }
                     }
                     Message::Binary(bytes) => {
-                        let text = std::str::from_utf8(&bytes)
-                            .map_err(|_| RuntimeError::NonUtf8Binary)?;
+                        let text = decode_binary_frame(&bytes, target.max_message_bytes)?;
                         let processed = process_text(
                             session.as_mut(),
-                            text,
+                            &text,
                             &desired,
                             context,
                             labels,
                             provider,
                             endpoint,
                         )?;
-                        if handle_processed_frame(
-                            processed,
-                            &mut commands,
-                            &mut live,
-                            &mut acknowledgement_deadline,
-                            target.subscription_ack_timeout,
-                            provider,
-                            endpoint,
-                            connection_epoch,
-                            desired.len(),
-                            context,
-                        )? {
-                            last_market_event = Instant::now();
+                        match processed {
+                            ProcessedFrame::Reply(reply) => {
+                                send_heartbeat(&mut writer, reply).await?;
+                            }
+                            processed => {
+                                if handle_processed_frame(
+                                    processed,
+                                    &mut commands,
+                                    &mut live,
+                                    &mut acknowledgement_deadline,
+                                    target.subscription_ack_timeout,
+                                    provider,
+                                    endpoint,
+                                    connection_epoch,
+                                    desired.len(),
+                                    context,
+                                )? {
+                                    last_market_event = Instant::now();
+                                }
+                            }
                         }
                     }
                     Message::Ping(payload) => {
@@ -452,6 +479,7 @@ fn process_text(
         Ok(ParsedFrame::Acknowledgement { request_id }) => {
             Ok(ProcessedFrame::Acknowledgement(request_id))
         }
+        Ok(ParsedFrame::Reply(reply)) => Ok(ProcessedFrame::Reply(reply)),
         Ok(ParsedFrame::Pong | ParsedFrame::Ignored) => Ok(ProcessedFrame::Other),
         Err(error @ AdapterError::CommandRejected { .. }) => Err(error.into()),
         Err(error) => {
@@ -501,7 +529,30 @@ where
 enum ProcessedFrame {
     Acknowledgement(String),
     DemandedMarketEvent,
+    Reply(Heartbeat),
     Other,
+}
+
+fn decode_binary_frame(bytes: &[u8], max_message_bytes: usize) -> Result<String, RuntimeError> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let limit = u64::try_from(max_message_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut gzip_reader = flate2::read::GzDecoder::new(bytes);
+        let mut uncompressed = Vec::new();
+        gzip_reader
+            .by_ref()
+            .take(limit)
+            .read_to_end(&mut uncompressed)
+            .map_err(|error| RuntimeError::InvalidBinary(error.to_string()))?;
+        if uncompressed.len() > max_message_bytes {
+            return Err(RuntimeError::DecompressedFrameTooLarge(max_message_bytes));
+        }
+        return String::from_utf8(uncompressed).map_err(|_| RuntimeError::NonUtf8Binary);
+    }
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| RuntimeError::NonUtf8Binary)
 }
 
 #[derive(Debug)]
@@ -526,7 +577,7 @@ struct CommandState {
 impl CommandState {
     fn enqueue(&mut self, commands: Vec<OutboundCommand>) -> Result<(), RuntimeError> {
         for command in commands {
-            if command.request_id.is_empty() || command.expected_acknowledgements == 0 {
+            if command.request_id.is_empty() {
                 return Err(RuntimeError::InvalidOutboundCommand);
             }
             if !self.known_request_ids.insert(command.request_id.clone()) {
@@ -554,6 +605,10 @@ impl CommandState {
         request_id: String,
         expected_acknowledgements: usize,
     ) -> Result<(), RuntimeError> {
+        if expected_acknowledgements == 0 {
+            self.known_request_ids.remove(&request_id);
+            return Ok(());
+        }
         let replaced = self.pending.insert(
             request_id.clone(),
             PendingAcknowledgements {
@@ -618,7 +673,7 @@ fn handle_processed_frame(
             Ok(false)
         }
         ProcessedFrame::DemandedMarketEvent => Ok(true),
-        ProcessedFrame::Other => Ok(false),
+        ProcessedFrame::Reply(_) | ProcessedFrame::Other => Ok(false),
     }
 }
 
@@ -723,6 +778,10 @@ enum RuntimeError {
     RegistryClosed,
     #[error("provider sent a non-UTF-8 binary frame")]
     NonUtf8Binary,
+    #[error("provider sent invalid compressed binary data: {0}")]
+    InvalidBinary(String),
+    #[error("provider decompressed binary frame exceeds the {0} byte limit")]
+    DecompressedFrameTooLarge(usize),
     #[error("provider generated an invalid outbound subscription command")]
     InvalidOutboundCommand,
     #[error("provider reused outbound request id {0}")]
@@ -737,6 +796,9 @@ enum RuntimeError {
 mod tests {
     use super::*;
     use crate::domain::{Channel, MarketKind};
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
 
     fn outbound(request_id: &str, expected_acknowledgements: usize) -> OutboundCommand {
         OutboundCommand {
@@ -877,5 +939,36 @@ mod tests {
         assert!(!commands.readiness_complete());
         commands.acknowledge("dynamic").unwrap();
         assert!(commands.readiness_complete());
+    }
+
+    #[test]
+    fn fire_and_forget_commands_complete_and_release_request_ids_when_sent() {
+        let mut commands = CommandState::default();
+        commands
+            .enqueue(vec![outbound("mexc-unsubscribe", 0)])
+            .unwrap();
+        assert!(!commands.readiness_complete());
+
+        send_next(&mut commands);
+
+        assert!(commands.readiness_complete());
+        assert!(!commands.known_request_ids.contains("mexc-unsubscribe"));
+    }
+
+    #[test]
+    fn gzip_binary_frames_are_decoded_with_a_decompressed_size_limit() {
+        let payload = br#"{"dataType":"FET-USDT@ticker"}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert_eq!(
+            decode_binary_frame(&compressed, payload.len()).unwrap(),
+            std::str::from_utf8(payload).unwrap()
+        );
+        assert!(matches!(
+            decode_binary_frame(&compressed, payload.len() - 1),
+            Err(RuntimeError::DecompressedFrameTooLarge(limit)) if limit == payload.len() - 1
+        ));
     }
 }

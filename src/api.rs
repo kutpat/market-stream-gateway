@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,17 +10,18 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::catalog::{Catalog, CatalogFilter, ProviderCatalogStatus};
-use crate::domain::{Channel, MarketKind, Provider, Subscription, SubscriptionKey};
+use crate::catalog::{Catalog, CatalogFilter, Instrument, ProviderCatalogStatus};
+use crate::domain::{Channel, DecimalValue, MarketKind, Provider, Subscription, SubscriptionKey};
 use crate::gateway::{ClientId, GatewayHub, RegistryError, SubscriptionRegistry};
 use crate::health::{EndpointHealth, HealthRegistry};
-use crate::history::{HistoryClient, HistoryError, HistoryRequest};
+use crate::history::{HistoryClient, HistoryError, HistoryRequest, HistoryResult};
 use crate::metrics::{Metrics, ProviderLabels};
 use crate::protocol::{ClientCommand, ControlMessage, ErrorCode};
 
@@ -101,6 +103,8 @@ async fn providers(State(state): State<AppState>) -> Json<Vec<ProviderDescriptor
         Provider::Binance,
         Provider::Okx,
         Provider::Kucoin,
+        Provider::Mexc,
+        Provider::Bingx,
     ]
     .into_iter()
     .map(|provider| ProviderDescriptor {
@@ -147,13 +151,16 @@ async fn candles(State(state): State<AppState>, Query(query): Query<CandleQuery>
             );
         }
     };
-    if let Err(error) = state.catalog.validate_subscription(&key) {
-        return api_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported_instrument",
-            &error.to_string(),
-        );
-    }
+    let instrument = match state.catalog.validate_subscription(&key) {
+        Ok(instrument) => instrument,
+        Err(error) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_instrument",
+                &error.to_string(),
+            );
+        }
+    };
     let request = match HistoryRequest::new(
         query.provider,
         &key.symbol,
@@ -180,7 +187,18 @@ async fn candles(State(state): State<AppState>, Query(query): Query<CandleQuery>
     let labels = ProviderLabels::new(query.provider);
     state.metrics.history_requests.get_or_create(&labels).inc();
     match state.history.fetch(&request).await {
-        Ok(result) => Json(result).into_response(),
+        Ok(mut result) => {
+            if let Err(error) = enrich_history_volumes(&mut result, &instrument) {
+                state.metrics.history_failures.get_or_create(&labels).inc();
+                warn!(provider = %query.provider, %error, "history_volume_enrichment_failed");
+                return api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "provider_unavailable",
+                    &format!("{} history request failed", query.provider),
+                );
+            }
+            Json(result).into_response()
+        }
         Err(HistoryError::InvalidRequest(message)) => {
             state.metrics.history_failures.get_or_create(&labels).inc();
             api_error(StatusCode::BAD_REQUEST, "invalid_request", &message)
@@ -195,6 +213,45 @@ async fn candles(State(state): State<AppState>, Query(query): Query<CandleQuery>
             )
         }
     }
+}
+
+fn enrich_history_volumes(
+    result: &mut HistoryResult,
+    instrument: &Instrument,
+) -> Result<(), String> {
+    if result.provider != Provider::Mexc {
+        return Ok(());
+    }
+    let contract_size = instrument
+        .contract_size
+        .as_ref()
+        .ok_or_else(|| "MEXC instrument is missing contract size".to_owned())?;
+    if instrument.contract_size_asset.as_deref() != Some(instrument.base_asset.as_str()) {
+        return Err("MEXC contract size is not denominated in the base asset".to_owned());
+    }
+    let contract_size = Decimal::from_str(contract_size.as_str())
+        .map_err(|_| "MEXC contract size is not a decimal".to_owned())?;
+    for row in &mut result.candles {
+        if row.candle.base_volume.is_some() {
+            continue;
+        }
+        let contracts = row
+            .candle
+            .contract_volume
+            .as_ref()
+            .ok_or_else(|| "MEXC history candle is missing contract volume".to_owned())?;
+        let contracts = Decimal::from_str(contracts.as_str())
+            .map_err(|_| "MEXC contract volume is not a decimal".to_owned())?;
+        let base_volume = contracts
+            .checked_mul(contract_size)
+            .ok_or_else(|| "MEXC base volume overflowed".to_owned())?;
+        row.candle.base_volume = Some(
+            DecimalValue::new(base_volume.normalize().to_string())
+                .map_err(|error| error.to_string())?,
+        );
+        row.candle.validate().map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 async fn stream(
@@ -652,6 +709,8 @@ mod tests {
                 Provider::Binance,
                 Provider::Okx,
                 Provider::Kucoin,
+                Provider::Mexc,
+                Provider::Bingx,
             ])),
             allowed_origins: Arc::new(BTreeSet::new()),
             max_command_bytes: 1024,
@@ -707,5 +766,77 @@ mod tests {
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
         assert_eq!(json["code"], "invalid_json");
         assert_eq!(json["message"], "invalid client command");
+    }
+
+    #[test]
+    fn mexc_history_contract_volume_is_converted_to_exact_base_volume() {
+        let capabilities = crate::catalog::InstrumentCapabilities {
+            ticker: true,
+            candle_1m: true,
+            candle_1m_finality: crate::catalog::CandleFinalitySupport::Unknown,
+            candle_1m_volume: crate::catalog::CandleVolumeSupport::Partial,
+            history_1m: true,
+            history_1m_finality: crate::catalog::CandleFinalitySupport::Authoritative,
+            history_1m_volume: crate::catalog::CandleVolumeSupport::Available,
+        };
+        let instrument = Instrument {
+            instrument_id: "mexc:linear_perpetual:FET_USDT".to_owned(),
+            symbol: "FET_USDT".to_owned(),
+            provider: Provider::Mexc,
+            market: MarketKind::LinearPerpetual,
+            base_asset: "FET".to_owned(),
+            quote_asset: "USDT".to_owned(),
+            settle_asset: "USDT".to_owned(),
+            status: crate::catalog::InstrumentStatus::Live,
+            venue_status: "state=0,type=1".to_owned(),
+            tick_size: DecimalValue::new("0.0001").unwrap(),
+            quantity_step: DecimalValue::new("1").unwrap(),
+            min_order_quantity: Some(DecimalValue::new("1").unwrap()),
+            min_notional: None,
+            contract_size: Some(DecimalValue::new("10").unwrap()),
+            contract_size_asset: Some("FET".to_owned()),
+            max_leverage: Some(DecimalValue::new("200").unwrap()),
+            listing_time_ms: None,
+            expiry_time_ms: None,
+            capabilities,
+        };
+        let mut result = HistoryResult {
+            provider: Provider::Mexc,
+            market: MarketKind::LinearPerpetual,
+            symbol: "FET_USDT".to_owned(),
+            start_time_ms: 60_000,
+            end_time_ms: 120_000,
+            candles: vec![crate::history::HistoryCandle {
+                provider: Provider::Mexc,
+                market: MarketKind::LinearPerpetual,
+                symbol: "FET_USDT".to_owned(),
+                candle: crate::domain::Candle {
+                    interval: "1m".to_owned(),
+                    start_time_ms: 60_000,
+                    end_time_ms: 120_000,
+                    open: DecimalValue::new("0.14").unwrap(),
+                    high: DecimalValue::new("0.15").unwrap(),
+                    low: DecimalValue::new("0.13").unwrap(),
+                    close: DecimalValue::new("0.14").unwrap(),
+                    base_volume: None,
+                    quote_volume: Some(DecimalValue::new("1051.19").unwrap()),
+                    contract_volume: Some(DecimalValue::new("751").unwrap()),
+                    finality: crate::domain::CandleFinality::Closed,
+                    data_quality: Vec::new(),
+                },
+            }],
+        };
+
+        enrich_history_volumes(&mut result, &instrument).unwrap();
+
+        assert_eq!(
+            result.candles[0]
+                .candle
+                .base_volume
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "7510"
+        );
     }
 }

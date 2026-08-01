@@ -15,8 +15,10 @@ use market_stream_gateway::history::{HistoryClient, HistorySources};
 use market_stream_gateway::metrics::{Metrics, ProviderLabels};
 use market_stream_gateway::providers::ProviderAdapter;
 use market_stream_gateway::providers::binance::BinanceAdapter;
+use market_stream_gateway::providers::bingx::BingxAdapter;
 use market_stream_gateway::providers::bybit::BybitAdapter;
 use market_stream_gateway::providers::kucoin::KucoinAdapter;
+use market_stream_gateway::providers::mexc::MexcAdapter;
 use market_stream_gateway::providers::okx::OkxAdapter;
 use market_stream_gateway::runtime::{RuntimeContext, spawn_provider_supervisors};
 use tokio::net::TcpListener;
@@ -64,6 +66,8 @@ async fn main() -> anyhow::Result<()> {
             binance: settings.binance_futures_rest_url.clone(),
             okx: settings.okx_rest_url.clone(),
             kucoin: settings.kucoin_futures_rest_url.clone(),
+            mexc: settings.mexc_futures_rest_url.clone(),
+            bingx: settings.bingx_swap_rest_url.clone(),
         },
     ));
 
@@ -150,6 +154,16 @@ fn configured_adapters(
             settings.kucoin_futures_rest_url.clone(),
         )));
     }
+    if enabled.contains(&Provider::Mexc) {
+        adapters.push(Arc::new(MexcAdapter::with_url(
+            settings.mexc_ws_url.clone(),
+        )));
+    }
+    if enabled.contains(&Provider::Bingx) {
+        adapters.push(Arc::new(BingxAdapter::with_url(
+            settings.bingx_ws_url.clone(),
+        )));
+    }
     adapters
 }
 
@@ -177,6 +191,16 @@ fn catalog_sources(
             &settings.kucoin_futures_rest_url,
             "api/v1/contracts/active",
             Provider::Kucoin,
+        )?,
+        mexc: provider_endpoint(
+            &settings.mexc_futures_rest_url,
+            "api/v1/contract/detail/country",
+            Provider::Mexc,
+        )?,
+        bingx: provider_endpoint(
+            &settings.bingx_swap_rest_url,
+            "openApi/swap/v2/quote/contracts",
+            Provider::Bingx,
         )?,
         enabled_providers,
     })

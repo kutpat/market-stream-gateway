@@ -8,6 +8,7 @@ use std::str;
 use std::time::Duration;
 
 use reqwest::{Client, StatusCode};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use thiserror::Error;
@@ -26,11 +27,17 @@ pub const BINANCE_KLINE_PATH: &str = "fapi/v1/klines";
 pub const BINANCE_TIME_PATH: &str = "fapi/v1/time";
 pub const OKX_HISTORY_CANDLES_PATH: &str = "api/v5/market/history-candles";
 pub const KUCOIN_KLINE_PATH: &str = "api/v1/kline/query";
+pub const MEXC_KLINE_PATH_PREFIX: &str = "api/v1/contract/kline/";
+pub const MEXC_TIME_PATH: &str = "api/v1/contract/ping";
+pub const BINGX_KLINE_PATH: &str = "openApi/swap/v3/quote/klines";
+pub const BINGX_TIME_PATH: &str = "openApi/swap/v2/server/time";
 
 const BYBIT_PAGE_LIMIT: usize = 1_000;
 const BINANCE_PAGE_LIMIT: usize = 1_500;
 const OKX_PAGE_LIMIT: usize = 300;
 const KUCOIN_PAGE_LIMIT: u64 = 500;
+const MEXC_PAGE_LIMIT: u64 = 2_000;
+const BINGX_PAGE_LIMIT: u64 = 1_440;
 const MAX_UPSTREAM_PAGES: usize = 40;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -44,6 +51,8 @@ pub struct HistorySources {
     pub binance: Url,
     pub okx: Url,
     pub kucoin: Url,
+    pub mexc: Url,
+    pub bingx: Url,
 }
 
 impl Default for HistorySources {
@@ -53,6 +62,8 @@ impl Default for HistorySources {
             binance: static_url("https://fapi.binance.com/"),
             okx: static_url("https://www.okx.com/"),
             kucoin: static_url("https://api-futures.kucoin.com/"),
+            mexc: static_url("https://api.mexc.com/"),
+            bingx: static_url("https://open-api.bingx.com/"),
         }
     }
 }
@@ -227,6 +238,8 @@ impl HistoryClient {
             Provider::Binance => self.fetch_binance(request).await?,
             Provider::Okx => self.fetch_okx(request).await?,
             Provider::Kucoin => self.fetch_kucoin(request).await?,
+            Provider::Mexc => self.fetch_mexc(request).await?,
+            Provider::Bingx => self.fetch_bingx(request).await?,
         };
         finish_result(request, candles)
     }
@@ -397,6 +410,87 @@ impl HistoryClient {
         Ok(candles)
     }
 
+    async fn fetch_mexc(&self, request: &HistoryRequest) -> Result<Vec<Candle>, HistoryError> {
+        let server_time_ms = self.mexc_server_time().await?;
+        let page_span = MEXC_PAGE_LIMIT
+            .checked_mul(CANDLE_INTERVAL_MS)
+            .ok_or_else(|| invalid_payload(Provider::Mexc, "page span overflow"))?;
+        let mut cursor_start = request.start_time_ms;
+        let mut pages = 0;
+        let mut candles = Vec::new();
+        while cursor_start < request.end_time_ms {
+            count_page(Provider::Mexc, &mut pages)?;
+            let page_end = cursor_start
+                .saturating_add(page_span)
+                .min(request.end_time_ms);
+            let path = format!("{MEXC_KLINE_PATH_PREFIX}{}", request.symbol);
+            let mut url = endpoint(&self.sources.mexc, &path, Provider::Mexc)?;
+            let inclusive_last_start = page_end
+                .checked_sub(CANDLE_INTERVAL_MS)
+                .ok_or_else(|| invalid_payload(Provider::Mexc, "page end underflow"))?;
+            url.query_pairs_mut()
+                .append_pair("interval", "Min1")
+                .append_pair("start", &(cursor_start / 1_000).to_string())
+                .append_pair("end", &(inclusive_last_start / 1_000).to_string());
+            let body = self.get_text(Provider::Mexc, url).await?;
+            candles.extend(parse_mexc(&body, server_time_ms)?);
+            if page_end <= cursor_start {
+                return Err(HistoryError::PaginationStalled {
+                    provider: Provider::Mexc,
+                    cursor_ms: cursor_start,
+                });
+            }
+            cursor_start = page_end;
+        }
+        Ok(candles)
+    }
+
+    async fn mexc_server_time(&self) -> Result<u64, HistoryError> {
+        let url = endpoint(&self.sources.mexc, MEXC_TIME_PATH, Provider::Mexc)?;
+        let body = self.get_text(Provider::Mexc, url).await?;
+        parse_mexc_server_time(&body)
+    }
+
+    async fn fetch_bingx(&self, request: &HistoryRequest) -> Result<Vec<Candle>, HistoryError> {
+        let server_time_ms = self.bingx_server_time().await?;
+        let page_span = BINGX_PAGE_LIMIT
+            .checked_mul(CANDLE_INTERVAL_MS)
+            .ok_or_else(|| invalid_payload(Provider::Bingx, "page span overflow"))?;
+        let mut cursor_start = request.start_time_ms;
+        let mut pages = 0;
+        let mut candles = Vec::new();
+        while cursor_start < request.end_time_ms {
+            count_page(Provider::Bingx, &mut pages)?;
+            let page_end = cursor_start
+                .saturating_add(page_span)
+                .min(request.end_time_ms);
+            let mut url = endpoint(&self.sources.bingx, BINGX_KLINE_PATH, Provider::Bingx)?;
+            let requested = (page_end - cursor_start) / CANDLE_INTERVAL_MS;
+            url.query_pairs_mut()
+                .append_pair("symbol", &request.symbol)
+                .append_pair("interval", "1m")
+                .append_pair("startTime", &cursor_start.to_string())
+                .append_pair("endTime", &exclusive_query_end(page_end)?.to_string())
+                .append_pair("limit", &requested.to_string());
+            let body = self.get_text(Provider::Bingx, url).await?;
+            candles.extend(parse_bingx(&body, server_time_ms)?);
+            if page_end <= cursor_start {
+                return Err(HistoryError::PaginationStalled {
+                    provider: Provider::Bingx,
+                    cursor_ms: cursor_start,
+                });
+            }
+            cursor_start = page_end;
+        }
+        Ok(candles)
+    }
+
+    async fn bingx_server_time(&self) -> Result<u64, HistoryError> {
+        let url = endpoint(&self.sources.bingx, BINGX_TIME_PATH, Provider::Bingx)?;
+        let body = self.get_text(Provider::Bingx, url).await?;
+        parse_bingx_server_time(&body)
+    }
+
     async fn get_text(&self, provider: Provider, url: Url) -> Result<String, HistoryError> {
         let response = self
             .http
@@ -469,6 +563,8 @@ fn validate_provider_symbol(provider: Provider, symbol: &str) -> Result<(), Hist
         Provider::Kucoin => {
             ascii_alphanumeric(symbol) && (symbol.ends_with("USDTM") || symbol.ends_with("USDCM"))
         }
+        Provider::Mexc => validate_mexc_symbol(symbol),
+        Provider::Bingx => validate_bingx_symbol(symbol),
     };
     if valid {
         Ok(())
@@ -492,6 +588,20 @@ fn validate_okx_symbol(symbol: &str) -> bool {
         return false;
     };
     let Some((base, quote)) = pair.split_once('-') else {
+        return false;
+    };
+    !base.contains('-') && ascii_alphanumeric(base) && matches!(quote, "USDT" | "USDC")
+}
+
+fn validate_mexc_symbol(symbol: &str) -> bool {
+    let Some((base, quote)) = symbol.split_once('_') else {
+        return false;
+    };
+    !base.contains('_') && ascii_alphanumeric(base) && matches!(quote, "USDT" | "USDC")
+}
+
+fn validate_bingx_symbol(symbol: &str) -> bool {
+    let Some((base, quote)) = symbol.split_once('-') else {
         return false;
     };
     !base.contains('-') && ascii_alphanumeric(base) && matches!(quote, "USDT" | "USDC")
@@ -594,10 +704,10 @@ fn build_candle(provider: Provider, fields: CandleFields) -> Result<Candle, Hist
         interval: "1m".to_owned(),
         start_time_ms: fields.start_time_ms,
         end_time_ms,
-        open: decimal(provider, fields.open, "open")?,
-        high: decimal(provider, fields.high, "high")?,
-        low: decimal(provider, fields.low, "low")?,
-        close: decimal(provider, fields.close, "close")?,
+        open: decimal(provider, &fields.open, "open")?,
+        high: decimal(provider, &fields.high, "high")?,
+        low: decimal(provider, &fields.low, "low")?,
+        close: decimal(provider, &fields.close, "close")?,
         base_volume: optional_decimal(provider, fields.base_volume, "base volume")?,
         quote_volume: optional_decimal(provider, fields.quote_volume, "quote volume")?,
         contract_volume: optional_decimal(provider, fields.contract_volume, "contract volume")?,
@@ -610,8 +720,15 @@ fn build_candle(provider: Provider, fields: CandleFields) -> Result<Candle, Hist
     Ok(candle)
 }
 
-fn decimal(provider: Provider, value: String, field: &str) -> Result<DecimalValue, HistoryError> {
-    DecimalValue::new(value)
+fn decimal(provider: Provider, value: &str, field: &str) -> Result<DecimalValue, HistoryError> {
+    let normalized = if value.contains(['e', 'E']) {
+        Decimal::from_scientific(value)
+            .map(|parsed| parsed.to_string())
+            .map_err(|_| invalid_payload(provider, format!("invalid {field}: {value}")))?
+    } else {
+        value.to_owned()
+    };
+    DecimalValue::new(normalized)
         .map_err(|error| invalid_payload(provider, format!("invalid {field}: {error}")))
 }
 
@@ -621,7 +738,7 @@ fn optional_decimal(
     field: &str,
 ) -> Result<Option<DecimalValue>, HistoryError> {
     value
-        .map(|value| decimal(provider, value, field))
+        .map(|value| decimal(provider, &value, field))
         .transpose()
 }
 
@@ -885,6 +1002,230 @@ fn parse_kucoin_row(row: &[Box<RawValue>]) -> Result<Candle, HistoryError> {
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct MexcHistoryEnvelope {
+    success: bool,
+    code: i64,
+    data: MexcHistoryData,
+}
+
+#[derive(Debug, Deserialize)]
+struct MexcHistoryData {
+    time: Vec<Box<RawValue>>,
+    open: Vec<Box<RawValue>>,
+    close: Vec<Box<RawValue>>,
+    high: Vec<Box<RawValue>>,
+    low: Vec<Box<RawValue>>,
+    vol: Vec<Box<RawValue>>,
+    amount: Vec<Box<RawValue>>,
+}
+
+fn parse_mexc(body: &str, server_time_ms: u64) -> Result<Vec<Candle>, HistoryError> {
+    let provider = Provider::Mexc;
+    let response: MexcHistoryEnvelope = parse_json(body, provider)?;
+    if !response.success || response.code != 0 {
+        return Err(provider_rejected(
+            provider,
+            response.code.to_string(),
+            format!("success={}", response.success),
+        ));
+    }
+    let data = response.data;
+    let expected = data.time.len();
+    for (field, actual) in [
+        ("open", data.open.len()),
+        ("close", data.close.len()),
+        ("high", data.high.len()),
+        ("low", data.low.len()),
+        ("vol", data.vol.len()),
+        ("amount", data.amount.len()),
+    ] {
+        if actual != expected {
+            return Err(invalid_payload(
+                provider,
+                format!("parallel {field} array has {actual} rows; expected {expected}"),
+            ));
+        }
+    }
+    (0..expected)
+        .map(|index| {
+            let start_time_ms = raw_u64(provider, &data.time[index], "time")?
+                .checked_mul(1_000)
+                .ok_or_else(|| invalid_payload(provider, "candle start timestamp overflow"))?;
+            let end_time_ms = start_time_ms
+                .checked_add(CANDLE_INTERVAL_MS)
+                .ok_or_else(|| invalid_payload(provider, "candle end timestamp overflow"))?;
+            build_candle(
+                provider,
+                CandleFields {
+                    start_time_ms,
+                    open: raw_decimal(provider, &data.open[index], "open")?,
+                    high: raw_decimal(provider, &data.high[index], "high")?,
+                    low: raw_decimal(provider, &data.low[index], "low")?,
+                    close: raw_decimal(provider, &data.close[index], "close")?,
+                    base_volume: None,
+                    quote_volume: Some(raw_decimal(provider, &data.amount[index], "quote volume")?),
+                    contract_volume: Some(raw_decimal(
+                        provider,
+                        &data.vol[index],
+                        "contract volume",
+                    )?),
+                    finality: elapsed_finality(end_time_ms, server_time_ms),
+                    data_quality: Vec::new(),
+                },
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct MexcTimeEnvelope {
+    success: bool,
+    code: i64,
+    data: u64,
+}
+
+fn parse_mexc_server_time(body: &str) -> Result<u64, HistoryError> {
+    let provider = Provider::Mexc;
+    let response: MexcTimeEnvelope = parse_json(body, provider)?;
+    if !response.success || response.code != 0 {
+        return Err(provider_rejected(
+            provider,
+            response.code.to_string(),
+            format!("success={}", response.success),
+        ));
+    }
+    if response.data == 0 {
+        return Err(invalid_payload(provider, "server time must be positive"));
+    }
+    Ok(response.data)
+}
+
+#[derive(Debug, Deserialize)]
+struct BingxHistoryEnvelope {
+    code: i64,
+    #[serde(default)]
+    msg: String,
+    data: Vec<Box<RawValue>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BingxHistoryObject {
+    open: Box<RawValue>,
+    close: Box<RawValue>,
+    high: Box<RawValue>,
+    low: Box<RawValue>,
+    volume: Box<RawValue>,
+    time: Box<RawValue>,
+}
+
+fn parse_bingx(body: &str, server_time_ms: u64) -> Result<Vec<Candle>, HistoryError> {
+    let provider = Provider::Bingx;
+    let response: BingxHistoryEnvelope = parse_json(body, provider)?;
+    if response.code != 0 {
+        return Err(provider_rejected(
+            provider,
+            response.code.to_string(),
+            response.msg,
+        ));
+    }
+    response
+        .data
+        .iter()
+        .map(|row| parse_bingx_row(row, server_time_ms))
+        .collect()
+}
+
+fn parse_bingx_row(row: &RawValue, server_time_ms: u64) -> Result<Candle, HistoryError> {
+    let provider = Provider::Bingx;
+    let raw = row.get().trim_start();
+    let fields = if raw.starts_with('{') {
+        let row: BingxHistoryObject = serde_json::from_str(raw).map_err(|error| {
+            invalid_payload(provider, format!("invalid object candle row: {error}"))
+        })?;
+        let start_time_ms = raw_u64(provider, &row.time, "time")?;
+        let end_time_ms = start_time_ms
+            .checked_add(CANDLE_INTERVAL_MS)
+            .ok_or_else(|| invalid_payload(provider, "candle end timestamp overflow"))?;
+        CandleFields {
+            start_time_ms,
+            open: raw_decimal(provider, &row.open, "open")?,
+            high: raw_decimal(provider, &row.high, "high")?,
+            low: raw_decimal(provider, &row.low, "low")?,
+            close: raw_decimal(provider, &row.close, "close")?,
+            base_volume: Some(raw_decimal(provider, &row.volume, "base volume")?),
+            quote_volume: None,
+            contract_volume: None,
+            finality: elapsed_finality(end_time_ms, server_time_ms),
+            data_quality: Vec::new(),
+        }
+    } else if raw.starts_with('[') {
+        let row: Vec<Box<RawValue>> = serde_json::from_str(raw).map_err(|error| {
+            invalid_payload(provider, format!("invalid array candle row: {error}"))
+        })?;
+        require_len(provider, row.len(), 11)?;
+        let start_time_ms = raw_u64(provider, &row[0], "open time")?;
+        let end_time_ms = start_time_ms
+            .checked_add(CANDLE_INTERVAL_MS)
+            .ok_or_else(|| invalid_payload(provider, "candle end timestamp overflow"))?;
+        let close_time_ms = raw_u64(provider, &row[6], "close time")?;
+        if close_time_ms.checked_add(1) != Some(end_time_ms) {
+            return Err(invalid_payload(
+                provider,
+                "one-minute candle close time is inconsistent with open time",
+            ));
+        }
+        CandleFields {
+            start_time_ms,
+            open: raw_decimal(provider, &row[1], "open")?,
+            high: raw_decimal(provider, &row[2], "high")?,
+            low: raw_decimal(provider, &row[3], "low")?,
+            close: raw_decimal(provider, &row[4], "close")?,
+            base_volume: Some(raw_decimal(provider, &row[5], "base volume")?),
+            quote_volume: Some(raw_decimal(provider, &row[7], "quote volume")?),
+            contract_volume: None,
+            finality: elapsed_finality(end_time_ms, server_time_ms),
+            data_quality: Vec::new(),
+        }
+    } else {
+        return Err(invalid_payload(
+            provider,
+            "candle row must be an object or array",
+        ));
+    };
+    build_candle(provider, fields)
+}
+
+#[derive(Debug, Deserialize)]
+struct BingxTimeEnvelope {
+    code: i64,
+    #[serde(default)]
+    msg: String,
+    data: BingxTimeData,
+}
+
+#[derive(Debug, Deserialize)]
+struct BingxTimeData {
+    #[serde(rename = "serverTime")]
+    server_time: u64,
+}
+
+fn parse_bingx_server_time(body: &str) -> Result<u64, HistoryError> {
+    let provider = Provider::Bingx;
+    let response: BingxTimeEnvelope = parse_json(body, provider)?;
+    if response.code != 0 {
+        return Err(provider_rejected(
+            provider,
+            response.code.to_string(),
+            response.msg,
+        ));
+    }
+    if response.data.server_time == 0 {
+        return Err(invalid_payload(provider, "serverTime must be positive"));
+    }
+    Ok(response.data.server_time)
+}
+
 fn raw_decimal(provider: Provider, value: &RawValue, field: &str) -> Result<String, HistoryError> {
     let raw = value.get();
     if raw.starts_with('"') {
@@ -949,7 +1290,9 @@ fn provider_error_details(provider: Provider, body: &str) -> Option<(String, Str
     let object = serde_json::from_str::<serde_json::Value>(body).ok()?;
     let (code_field, message_field) = match provider {
         Provider::Bybit => ("retCode", "retMsg"),
-        Provider::Binance | Provider::Okx | Provider::Kucoin => ("code", "msg"),
+        Provider::Binance | Provider::Okx | Provider::Kucoin | Provider::Mexc | Provider::Bingx => {
+            ("code", "msg")
+        }
     };
     let code = object.get(code_field)?;
     let code = code
@@ -1130,6 +1473,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_mexc_parallel_arrays_and_server_time_finality() {
+        let start_seconds = START / 1_000;
+        let body = format!(
+            r#"{{"success":true,"code":0,"data":{{"time":[{start_seconds}],"open":[0.1400],"close":[0.1420],"high":[0.1430],"low":[0.1390],"vol":[12],"amount":[1.140119803232E7],"realOpen":[0.1400],"realClose":[0.1420],"realHigh":[0.1430],"realLow":[0.1390]}}}}"#,
+        );
+
+        let candle = parse_mexc(&body, START + CANDLE_INTERVAL_MS)
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(candle.open.as_str(), "0.1400");
+        assert_eq!(candle.contract_volume.as_ref().unwrap().as_str(), "12");
+        assert_eq!(
+            candle.quote_volume.as_ref().unwrap().as_str(),
+            "11401198.03232"
+        );
+        assert_eq!(candle.finality, CandleFinality::Closed);
+        assert_eq!(
+            parse_mexc_server_time(r#"{"success":true,"code":0,"data":1785558988408}"#).unwrap(),
+            1_785_558_988_408
+        );
+    }
+
+    #[test]
+    fn parses_bingx_object_rows_and_distinguishes_open_interval() {
+        let body = format!(
+            r#"{{"code":0,"msg":"","data":[{{"open":"0.1419","close":"0.1420","high":"0.1421","low":"0.1418","volume":"6835","time":{}}},{{"open":"0.1420","close":"0.1422","high":"0.1423","low":"0.1419","volume":"123","time":{}}}]}}"#,
+            START,
+            START + CANDLE_INTERVAL_MS,
+        );
+
+        let candles = parse_bingx(&body, START + 90_000).unwrap();
+
+        assert_eq!(candles[0].finality, CandleFinality::Closed);
+        assert_eq!(candles[1].finality, CandleFinality::Open);
+        assert_eq!(candles[0].base_volume.as_ref().unwrap().as_str(), "6835");
+        assert!(candles[0].quote_volume.is_none());
+        let documented = format!(
+            r#"{{"code":0,"msg":"","data":[[{START},"0.1419","0.1421","0.1418","0.1420","6835",{},"970.57",12,"3000","426.0"]]}}"#,
+            START + CANDLE_INTERVAL_MS - 1,
+        );
+        let documented = parse_bingx(&documented, START + CANDLE_INTERVAL_MS)
+            .unwrap()
+            .remove(0);
+        assert_eq!(documented.base_volume.as_ref().unwrap().as_str(), "6835");
+        assert_eq!(documented.quote_volume.as_ref().unwrap().as_str(), "970.57");
+        assert_eq!(
+            parse_bingx_server_time(r#"{"code":0,"msg":"","data":{"serverTime":1785558987873}}"#)
+                .unwrap(),
+            1_785_558_987_873
+        );
+    }
+
+    #[test]
     fn surfaces_provider_response_codes() {
         assert!(matches!(
             parse_bybit(
@@ -1191,7 +1588,9 @@ mod tests {
             bybit: base.clone(),
             binance: base.clone(),
             okx: base.clone(),
-            kucoin: base,
+            kucoin: base.clone(),
+            mexc: base.clone(),
+            bingx: base,
         };
         let client = HistoryClient::with_client(Client::new(), sources);
         let end = START + 501 * CANDLE_INTERVAL_MS;

@@ -15,6 +15,8 @@ pub enum Provider {
     Binance,
     Okx,
     Kucoin,
+    Mexc,
+    Bingx,
 }
 
 impl fmt::Display for Provider {
@@ -24,6 +26,8 @@ impl fmt::Display for Provider {
             Self::Binance => "binance",
             Self::Okx => "okx",
             Self::Kucoin => "kucoin",
+            Self::Mexc => "mexc",
+            Self::Bingx => "bingx",
         };
         formatter.write_str(value)
     }

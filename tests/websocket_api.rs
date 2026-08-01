@@ -157,7 +157,9 @@ async fn test_catalog() -> Arc<Catalog> {
             bybit: endpoint.clone(),
             binance: endpoint.clone(),
             okx: endpoint.clone(),
-            kucoin: endpoint,
+            kucoin: endpoint.clone(),
+            mexc: endpoint.clone(),
+            bingx: endpoint,
             enabled_providers: BTreeSet::from([Provider::Bybit]),
         },
     ));
