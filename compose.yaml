@@ -1,0 +1,39 @@
+services:
+  market-stream-gateway:
+    build:
+      context: .
+    image: market-stream-gateway:local
+    init: true
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    ports:
+      - "127.0.0.1:18070:8080"
+    environment:
+      MSG_BIND: 0.0.0.0:8080
+      MSG_LOG_FORMAT: json
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/market-stream-healthcheck"]
+      interval: 10s
+      timeout: 4s
+      start_period: 5s
+      retries: 3
+    stop_grace_period: 15s
+    pids_limit: 128
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    mem_limit: 256m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
