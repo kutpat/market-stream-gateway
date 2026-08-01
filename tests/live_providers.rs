@@ -11,8 +11,10 @@ use market_stream_gateway::health::HealthRegistry;
 use market_stream_gateway::metrics::Metrics;
 use market_stream_gateway::providers::ProviderAdapter;
 use market_stream_gateway::providers::binance::BinanceAdapter;
+use market_stream_gateway::providers::bingx::BingxAdapter;
 use market_stream_gateway::providers::bybit::BybitAdapter;
 use market_stream_gateway::providers::kucoin::KucoinAdapter;
+use market_stream_gateway::providers::mexc::MexcAdapter;
 use market_stream_gateway::providers::okx::OkxAdapter;
 use market_stream_gateway::runtime::{RuntimeContext, spawn_provider_supervisors};
 use tokio_util::sync::CancellationToken;
@@ -46,6 +48,8 @@ async fn all_provider_tickers_and_candles_stream_live() {
         Arc::new(BinanceAdapter::default()),
         Arc::new(OkxAdapter::default()),
         Arc::new(KucoinAdapter::default()),
+        Arc::new(MexcAdapter::default()),
+        Arc::new(BingxAdapter::default()),
     ];
     let tasks = spawn_provider_supervisors(adapters, context);
     let expected = subscriptions();
@@ -55,7 +59,7 @@ async fn all_provider_tickers_and_candles_stream_live() {
         .await
         .unwrap();
 
-    let observed = tokio::time::timeout(Duration::from_secs(90), async {
+    let observed = tokio::time::timeout(Duration::from_mins(2), async {
         let mut observed = BTreeSet::new();
         while observed.len() < expected.len() {
             let event = events.recv().await.unwrap();
@@ -73,7 +77,7 @@ async fn all_provider_tickers_and_candles_stream_live() {
         observed
     })
     .await
-    .expect("all public providers should produce ticker and candle data within 90 seconds");
+    .expect("all public providers should produce ticker and candle data within 120 seconds");
 
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(10), join_all(tasks))
@@ -88,6 +92,8 @@ fn subscriptions() -> BTreeSet<SubscriptionKey> {
         (Provider::Binance, "BTCUSDT"),
         (Provider::Okx, "BTC-USDT-SWAP"),
         (Provider::Kucoin, "XBTUSDTM"),
+        (Provider::Mexc, "FET_USDT"),
+        (Provider::Bingx, "FET-USDT"),
     ]
     .into_iter()
     .flat_map(|(provider, symbol)| {

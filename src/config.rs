@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::domain::Provider;
 
-pub const MAX_SAFE_PROVIDER_SUBSCRIPTIONS: usize = 250;
+pub const MAX_SAFE_PROVIDER_SUBSCRIPTIONS: usize = 60;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "market-stream-gateway", version, about)]
@@ -93,6 +93,20 @@ pub struct Settings {
 
     #[arg(
         long,
+        env = "MSG_MEXC_WS_URL",
+        default_value = "wss://contract.mexc.com/edge"
+    )]
+    pub mexc_ws_url: Url,
+
+    #[arg(
+        long,
+        env = "MSG_BINGX_WS_URL",
+        default_value = "wss://open-api-swap.bingx.com/swap-market"
+    )]
+    pub bingx_ws_url: Url,
+
+    #[arg(
+        long,
         env = "MSG_BYBIT_REST_URL",
         default_value = "https://api.bybit.com/"
     )]
@@ -114,6 +128,20 @@ pub struct Settings {
         default_value = "https://api-futures.kucoin.com/"
     )]
     pub kucoin_futures_rest_url: Url,
+
+    #[arg(
+        long,
+        env = "MSG_MEXC_FUTURES_REST_URL",
+        default_value = "https://api.mexc.com/"
+    )]
+    pub mexc_futures_rest_url: Url,
+
+    #[arg(
+        long,
+        env = "MSG_BINGX_SWAP_REST_URL",
+        default_value = "https://open-api.bingx.com/"
+    )]
+    pub bingx_swap_rest_url: Url,
 
     #[arg(
         long,
@@ -172,6 +200,8 @@ impl Settings {
             ("Binance websocket", &self.binance_ws_url),
             ("OKX public websocket", &self.okx_public_ws_url),
             ("OKX business websocket", &self.okx_business_ws_url),
+            ("MEXC websocket", &self.mexc_ws_url),
+            ("BingX websocket", &self.bingx_ws_url),
         ] {
             if !matches!(url.scheme(), "ws" | "wss") {
                 return Err(format!("{name} URL must use ws or wss"));
@@ -182,6 +212,8 @@ impl Settings {
             ("Binance Futures REST", &self.binance_futures_rest_url),
             ("OKX REST", &self.okx_rest_url),
             ("KuCoin Futures REST", &self.kucoin_futures_rest_url),
+            ("MEXC Futures REST", &self.mexc_futures_rest_url),
+            ("BingX Swap REST", &self.bingx_swap_rest_url),
         ] {
             if !matches!(url.scheme(), "http" | "https") {
                 return Err(format!("{name} URL must use http or https"));
@@ -236,6 +268,8 @@ impl Settings {
                 Provider::Binance,
                 Provider::Okx,
                 Provider::Kucoin,
+                Provider::Mexc,
+                Provider::Bingx,
             ]
             .into_iter()
             .collect();
@@ -261,6 +295,8 @@ pub enum ProviderSelection {
     Binance,
     Okx,
     Kucoin,
+    Mexc,
+    Bingx,
 }
 
 impl ProviderSelection {
@@ -271,6 +307,8 @@ impl ProviderSelection {
             Self::Binance => Some(Provider::Binance),
             Self::Okx => Some(Provider::Okx),
             Self::Kucoin => Some(Provider::Kucoin),
+            Self::Mexc => Some(Provider::Mexc),
+            Self::Bingx => Some(Provider::Bingx),
         }
     }
 }
@@ -290,7 +328,7 @@ mod tests {
         );
         assert!(settings.validate().is_ok());
         assert_eq!(settings.binance_ws_url.path(), "/market/ws");
-        assert_eq!(settings.enabled_providers().len(), 4);
+        assert_eq!(settings.enabled_providers().len(), 6);
     }
 
     #[test]

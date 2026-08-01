@@ -24,14 +24,18 @@ const BYBIT_CATALOG_URL: &str = "https://api.bybit.com/v5/market/instruments-inf
 const BINANCE_CATALOG_URL: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
 const OKX_CATALOG_URL: &str = "https://www.okx.com/api/v5/public/instruments";
 const KUCOIN_CATALOG_URL: &str = "https://api-futures.kucoin.com/api/v1/contracts/active";
+const MEXC_CATALOG_URL: &str = "https://api.mexc.com/api/v1/contract/detail/country";
+const BINGX_CATALOG_URL: &str = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts";
 const BYBIT_PAGE_LIMIT: &str = "1000";
 const BYBIT_MAX_PAGES: usize = 10_000;
 const MAX_CATALOG_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
-const ALL_PROVIDERS: [Provider; 4] = [
+const ALL_PROVIDERS: [Provider; 6] = [
     Provider::Bybit,
     Provider::Binance,
     Provider::Okx,
     Provider::Kucoin,
+    Provider::Mexc,
+    Provider::Bingx,
 ];
 
 /// Normalized lifecycle state. Catalog snapshots contain live instruments only.
@@ -54,6 +58,7 @@ pub enum CandleFinalitySupport {
 #[serde(rename_all = "snake_case")]
 pub enum CandleVolumeSupport {
     Available,
+    Partial,
     Unavailable,
 }
 
@@ -65,6 +70,9 @@ pub struct InstrumentCapabilities {
     pub candle_1m: bool,
     pub candle_1m_finality: CandleFinalitySupport,
     pub candle_1m_volume: CandleVolumeSupport,
+    pub history_1m: bool,
+    pub history_1m_finality: CandleFinalitySupport,
+    pub history_1m_volume: CandleVolumeSupport,
 }
 
 impl InstrumentCapabilities {
@@ -97,6 +105,10 @@ pub struct Instrument {
     pub tick_size: DecimalValue,
     pub quantity_step: DecimalValue,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_order_quantity: Option<DecimalValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_notional: Option<DecimalValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contract_size: Option<DecimalValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contract_size_asset: Option<String>,
@@ -116,6 +128,8 @@ pub struct CatalogSources {
     pub binance: Url,
     pub okx: Url,
     pub kucoin: Url,
+    pub mexc: Url,
+    pub bingx: Url,
     pub enabled_providers: BTreeSet<Provider>,
 }
 
@@ -126,6 +140,8 @@ impl CatalogSources {
             Provider::Binance => &self.binance,
             Provider::Okx => &self.okx,
             Provider::Kucoin => &self.kucoin,
+            Provider::Mexc => &self.mexc,
+            Provider::Bingx => &self.bingx,
         }
     }
 
@@ -141,6 +157,8 @@ impl Default for CatalogSources {
             binance: static_url(BINANCE_CATALOG_URL),
             okx: static_url(OKX_CATALOG_URL),
             kucoin: static_url(KUCOIN_CATALOG_URL),
+            mexc: static_url(MEXC_CATALOG_URL),
+            bingx: static_url(BINGX_CATALOG_URL),
             enabled_providers: ALL_PROVIDERS.into_iter().collect(),
         }
     }
@@ -446,6 +464,18 @@ impl Catalog {
                     .await?;
                 parse_kucoin_catalog(&body)
             }
+            Provider::Mexc => {
+                let body = self
+                    .get_body(provider, self.sources.endpoint(provider))
+                    .await?;
+                parse_mexc_catalog(&body)
+            }
+            Provider::Bingx => {
+                let body = self
+                    .get_body(provider, self.sources.endpoint(provider))
+                    .await?;
+                parse_bingx_catalog(&body)
+            }
         }
     }
 
@@ -568,6 +598,8 @@ struct ProviderRefreshLocks {
     binance: Mutex<()>,
     okx: Mutex<()>,
     kucoin: Mutex<()>,
+    mexc: Mutex<()>,
+    bingx: Mutex<()>,
 }
 
 impl ProviderRefreshLocks {
@@ -577,6 +609,8 @@ impl ProviderRefreshLocks {
             Provider::Binance => &self.binance,
             Provider::Okx => &self.okx,
             Provider::Kucoin => &self.kucoin,
+            Provider::Mexc => &self.mexc,
+            Provider::Bingx => &self.bingx,
         }
     }
 }
@@ -631,6 +665,10 @@ struct BybitPriceFilter {
 #[serde(rename_all = "camelCase")]
 struct BybitLotSizeFilter {
     qty_step: WireScalar,
+    #[serde(default)]
+    min_order_qty: Option<WireScalar>,
+    #[serde(default)]
+    min_notional_value: Option<WireScalar>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -704,7 +742,17 @@ fn bybit_instrument(item: BybitInstrument) -> Result<Option<Instrument>, Catalog
         quantity_step: positive_decimal(
             provider,
             "lotSizeFilter.qtyStep",
-            item.lot_size_filter.qty_step,
+            item.lot_size_filter.qty_step.clone(),
+        )?,
+        min_order_quantity: optional_positive_decimal(
+            provider,
+            "lotSizeFilter.minOrderQty",
+            item.lot_size_filter.min_order_qty,
+        )?,
+        min_notional: optional_positive_decimal(
+            provider,
+            "lotSizeFilter.minNotionalValue",
+            item.lot_size_filter.min_notional_value,
         )?,
         contract_size: None,
         contract_size_asset: None,
@@ -740,6 +788,8 @@ struct BinanceFilter {
     filter_type: String,
     tick_size: Option<WireScalar>,
     step_size: Option<WireScalar>,
+    min_qty: Option<WireScalar>,
+    notional: Option<WireScalar>,
 }
 
 fn parse_binance_catalog(body: &str) -> Result<BTreeMap<String, Instrument>, CatalogError> {
@@ -771,6 +821,17 @@ fn binance_instrument(item: BinanceInstrument) -> Result<Option<Instrument>, Cat
         unique_filter_decimal(provider, &item.filters, "LOT_SIZE", "stepSize", |filter| {
             filter.step_size.clone()
         })?;
+    let min_order_quantity =
+        optional_unique_filter_decimal(provider, &item.filters, "LOT_SIZE", "minQty", |filter| {
+            filter.min_qty.clone()
+        })?;
+    let min_notional = optional_unique_filter_decimal(
+        provider,
+        &item.filters,
+        "MIN_NOTIONAL",
+        "notional",
+        |filter| filter.notional.clone(),
+    )?;
     let symbol = exact_symbol(provider, item.symbol)?;
     Ok(Some(Instrument {
         instrument_id: instrument_id(provider, &symbol),
@@ -784,6 +845,8 @@ fn binance_instrument(item: BinanceInstrument) -> Result<Option<Instrument>, Cat
         venue_status: item.status,
         tick_size,
         quantity_step,
+        min_order_quantity,
+        min_notional,
         contract_size: None,
         contract_size_asset: None,
         max_leverage: None,
@@ -819,6 +882,32 @@ where
     positive_decimal(provider, &format!("{filter_type}.{field}"), scalar)
 }
 
+fn optional_unique_filter_decimal<F>(
+    provider: Provider,
+    filters: &[BinanceFilter],
+    filter_type: &str,
+    field: &str,
+    value: F,
+) -> Result<Option<DecimalValue>, CatalogError>
+where
+    F: Fn(&BinanceFilter) -> Option<WireScalar>,
+{
+    let matching = filters
+        .iter()
+        .filter(|filter| filter.filter_type == filter_type)
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [] => Ok(None),
+        [filter] => value(filter)
+            .map(|scalar| positive_decimal(provider, &format!("{filter_type}.{field}"), scalar))
+            .transpose(),
+        _ => Err(invalid_payload(
+            provider,
+            format!("expected at most one {filter_type}, got {}", matching.len()),
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct OkxEnvelope {
     code: String,
@@ -844,6 +933,8 @@ struct OkxInstrument {
     ct_val_ccy: String,
     tick_sz: WireScalar,
     lot_sz: WireScalar,
+    #[serde(default)]
+    min_sz: Option<WireScalar>,
     #[serde(default)]
     lever: Option<WireScalar>,
     #[serde(default)]
@@ -909,6 +1000,8 @@ fn okx_instrument(item: OkxInstrument) -> Result<Option<Instrument>, CatalogErro
         venue_status: item.state,
         tick_size: positive_decimal(provider, "tickSz", item.tick_sz)?,
         quantity_step: positive_decimal(provider, "lotSz", item.lot_sz)?,
+        min_order_quantity: optional_positive_decimal(provider, "minSz", item.min_sz)?,
+        min_notional: None,
         contract_size: Some(positive_decimal(provider, "ctVal", item.ct_val)?),
         contract_size_asset: Some(contract_size_asset),
         max_leverage: optional_positive_decimal(provider, "lever", item.lever)?,
@@ -1020,6 +1113,7 @@ fn kucoin_instrument(item: KucoinInstrument) -> Result<Option<Instrument>, Catal
     }
     let symbol = exact_symbol(provider, item.symbol)?;
     let base_asset = exact_asset(provider, "baseCurrency", item.base_currency)?;
+    let quantity_step = positive_decimal(provider, "lotSize", item.lot_size)?;
     Ok(Some(Instrument {
         instrument_id: instrument_id(provider, &symbol),
         symbol,
@@ -1031,7 +1125,9 @@ fn kucoin_instrument(item: KucoinInstrument) -> Result<Option<Instrument>, Catal
         status: InstrumentStatus::Live,
         venue_status: item.status,
         tick_size: positive_decimal(provider, "tickSize", item.tick_size)?,
-        quantity_step: positive_decimal(provider, "lotSize", item.lot_size)?,
+        quantity_step: quantity_step.clone(),
+        min_order_quantity: Some(quantity_step),
+        min_notional: None,
         contract_size: Some(positive_decimal(provider, "multiplier", item.multiplier)?),
         contract_size_asset: Some(base_asset),
         max_leverage: optional_positive_decimal(provider, "maxLeverage", item.max_leverage)?,
@@ -1039,6 +1135,232 @@ fn kucoin_instrument(item: KucoinInstrument) -> Result<Option<Instrument>, Catal
         expiry_time_ms: None,
         capabilities: capabilities(provider),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct MexcEnvelope {
+    success: bool,
+    code: i64,
+    data: Option<OneOrMany<MexcInstrument>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MexcInstrument {
+    symbol: String,
+    base_coin: String,
+    quote_coin: String,
+    settle_coin: String,
+    future_type: i64,
+    state: i64,
+    #[serde(rename = "type")]
+    contract_state: i64,
+    #[serde(default)]
+    pre_market: bool,
+    contract_size: WireScalar,
+    price_unit: WireScalar,
+    vol_unit: WireScalar,
+    #[serde(default)]
+    min_vol: Option<WireScalar>,
+    #[serde(default)]
+    max_leverage: Option<WireScalar>,
+    #[serde(default)]
+    create_time: Option<WireScalar>,
+    #[serde(default)]
+    opening_time: Option<WireScalar>,
+}
+
+fn parse_mexc_catalog(body: &str) -> Result<BTreeMap<String, Instrument>, CatalogError> {
+    let provider = Provider::Mexc;
+    let envelope: MexcEnvelope = serde_json::from_str(body)
+        .map_err(|error| invalid_payload(provider, format!("invalid JSON: {error}")))?;
+    if !envelope.success || envelope.code != 0 {
+        return Err(invalid_payload(
+            provider,
+            format!(
+                "endpoint returned success={} code={}",
+                envelope.success, envelope.code
+            ),
+        ));
+    }
+    let items = envelope
+        .data
+        .ok_or_else(|| invalid_payload(provider, "missing data"))?
+        .into_vec();
+    let mut instruments = BTreeMap::new();
+    for item in items {
+        if let Some(instrument) = mexc_instrument(item)? {
+            insert_unique(&mut instruments, instrument)?;
+        }
+    }
+    Ok(instruments)
+}
+
+fn mexc_instrument(item: MexcInstrument) -> Result<Option<Instrument>, CatalogError> {
+    let provider = Provider::Mexc;
+    if item.future_type != 1
+        || item.state != 0
+        || item.contract_state != 1
+        || item.pre_market
+        || item.quote_coin != "USDT"
+        || item.settle_coin != "USDT"
+    {
+        return Ok(None);
+    }
+    let listing_time_ms = optional_timestamp_ms(provider, "openingTime", item.opening_time)?.or(
+        optional_timestamp_ms(provider, "createTime", item.create_time)?,
+    );
+    let symbol = exact_symbol(provider, item.symbol)?;
+    let base_asset = exact_asset(provider, "baseCoin", item.base_coin)?;
+    Ok(Some(Instrument {
+        instrument_id: instrument_id(provider, &symbol),
+        symbol,
+        provider,
+        market: MarketKind::LinearPerpetual,
+        base_asset: base_asset.clone(),
+        quote_asset: exact_asset(provider, "quoteCoin", item.quote_coin)?,
+        settle_asset: exact_asset(provider, "settleCoin", item.settle_coin)?,
+        status: InstrumentStatus::Live,
+        venue_status: format!("state={},type={}", item.state, item.contract_state),
+        tick_size: positive_decimal(provider, "priceUnit", item.price_unit)?,
+        quantity_step: positive_decimal(provider, "volUnit", item.vol_unit)?,
+        min_order_quantity: optional_positive_decimal(provider, "minVol", item.min_vol)?,
+        min_notional: None,
+        contract_size: Some(positive_decimal(
+            provider,
+            "contractSize",
+            item.contract_size,
+        )?),
+        contract_size_asset: Some(base_asset),
+        max_leverage: optional_positive_decimal(provider, "maxLeverage", item.max_leverage)?,
+        listing_time_ms,
+        expiry_time_ms: None,
+        capabilities: capabilities(provider),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BingxEnvelope {
+    code: i64,
+    #[serde(default)]
+    msg: String,
+    data: Vec<BingxInstrument>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BingxInstrument {
+    symbol: String,
+    asset: String,
+    currency: String,
+    status: i64,
+    api_state_open: String,
+    size: WireScalar,
+    price_precision: u32,
+    quantity_precision: u32,
+    #[serde(default)]
+    trade_min_quantity: Option<WireScalar>,
+    #[serde(default)]
+    #[serde(rename = "tradeMinUSDT")]
+    trade_min_usdt: Option<WireScalar>,
+    #[serde(default)]
+    max_long_leverage: Option<WireScalar>,
+    #[serde(default)]
+    max_short_leverage: Option<WireScalar>,
+    #[serde(default)]
+    launch_time: u64,
+    #[serde(default)]
+    off_time: u64,
+}
+
+fn parse_bingx_catalog(body: &str) -> Result<BTreeMap<String, Instrument>, CatalogError> {
+    let provider = Provider::Bingx;
+    let envelope: BingxEnvelope = serde_json::from_str(body)
+        .map_err(|error| invalid_payload(provider, format!("invalid JSON: {error}")))?;
+    if envelope.code != 0 {
+        return Err(invalid_payload(
+            provider,
+            format!("endpoint returned code {}: {}", envelope.code, envelope.msg),
+        ));
+    }
+    let mut instruments = BTreeMap::new();
+    for item in envelope.data {
+        if let Some(instrument) = bingx_instrument(item)? {
+            insert_unique(&mut instruments, instrument)?;
+        }
+    }
+    Ok(instruments)
+}
+
+fn bingx_instrument(item: BingxInstrument) -> Result<Option<Instrument>, CatalogError> {
+    let provider = Provider::Bingx;
+    if item.status != 1
+        || item.api_state_open != "true"
+        || !matches!(item.currency.as_str(), "USDT" | "USDC")
+    {
+        return Ok(None);
+    }
+    let symbol = exact_symbol(provider, item.symbol)?;
+    let base_asset = exact_asset(provider, "asset", item.asset)?;
+    let quote_asset = exact_asset(provider, "currency", item.currency)?;
+    let max_long = optional_positive_decimal(provider, "maxLongLeverage", item.max_long_leverage)?;
+    let max_short =
+        optional_positive_decimal(provider, "maxShortLeverage", item.max_short_leverage)?;
+    let max_leverage = match (max_long, max_short) {
+        (Some(long), Some(short)) => {
+            let long_value = Decimal::from_str(long.as_str())
+                .map_err(|_| invalid_payload(provider, "maxLongLeverage is not a decimal"))?;
+            let short_value = Decimal::from_str(short.as_str())
+                .map_err(|_| invalid_payload(provider, "maxShortLeverage is not a decimal"))?;
+            Some(if long_value <= short_value {
+                long
+            } else {
+                short
+            })
+        }
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    Ok(Some(Instrument {
+        instrument_id: instrument_id(provider, &symbol),
+        symbol,
+        provider,
+        market: MarketKind::LinearPerpetual,
+        base_asset: base_asset.clone(),
+        quote_asset: quote_asset.clone(),
+        settle_asset: quote_asset,
+        status: InstrumentStatus::Live,
+        venue_status: item.status.to_string(),
+        tick_size: precision_step(provider, "pricePrecision", item.price_precision)?,
+        quantity_step: precision_step(provider, "quantityPrecision", item.quantity_precision)?,
+        min_order_quantity: optional_positive_decimal(
+            provider,
+            "tradeMinQuantity",
+            item.trade_min_quantity,
+        )?,
+        min_notional: optional_positive_decimal(provider, "tradeMinUSDT", item.trade_min_usdt)?,
+        contract_size: Some(positive_decimal(provider, "size", item.size)?),
+        contract_size_asset: Some(base_asset),
+        max_leverage,
+        listing_time_ms: (item.launch_time != 0).then_some(item.launch_time),
+        expiry_time_ms: (item.off_time != 0).then_some(item.off_time),
+        capabilities: capabilities(provider),
+    }))
+}
+
+fn precision_step(
+    provider: Provider,
+    field: &str,
+    precision: u32,
+) -> Result<DecimalValue, CatalogError> {
+    if precision > Decimal::MAX_SCALE {
+        return Err(invalid_payload(
+            provider,
+            format!("{field} exceeds decimal scale {}", Decimal::MAX_SCALE),
+        ));
+    }
+    DecimalValue::new(Decimal::new(1, precision).to_string())
+        .map_err(|error| invalid_payload(provider, format!("invalid {field}: {error}")))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1110,22 +1432,41 @@ fn optional_timestamp_ms(
 }
 
 fn capabilities(provider: Provider) -> InstrumentCapabilities {
-    let (candle_1m_finality, candle_1m_volume) = if provider == Provider::Kucoin {
-        (
+    let (candle_1m_finality, candle_1m_volume) = match provider {
+        Provider::Kucoin => (
             CandleFinalitySupport::Unknown,
             CandleVolumeSupport::Unavailable,
-        )
-    } else {
-        (
+        ),
+        Provider::Mexc | Provider::Bingx => {
+            (CandleFinalitySupport::Unknown, CandleVolumeSupport::Partial)
+        }
+        Provider::Bybit | Provider::Binance | Provider::Okx => (
             CandleFinalitySupport::Authoritative,
             CandleVolumeSupport::Available,
-        )
+        ),
+    };
+    let (history_1m_finality, history_1m_volume) = match provider {
+        Provider::Kucoin => (
+            CandleFinalitySupport::Unknown,
+            CandleVolumeSupport::Unavailable,
+        ),
+        Provider::Bingx => (
+            CandleFinalitySupport::Authoritative,
+            CandleVolumeSupport::Partial,
+        ),
+        Provider::Bybit | Provider::Binance | Provider::Okx | Provider::Mexc => (
+            CandleFinalitySupport::Authoritative,
+            CandleVolumeSupport::Available,
+        ),
     };
     InstrumentCapabilities {
         ticker: true,
         candle_1m: true,
         candle_1m_finality,
         candle_1m_volume,
+        history_1m: true,
+        history_1m_finality,
+        history_1m_volume,
     }
 }
 
@@ -1244,6 +1585,11 @@ mod tests {
         assert_eq!(instrument.base_asset, "BTC");
         assert_eq!(instrument.tick_size.as_str(), "0.10");
         assert_eq!(instrument.quantity_step.as_str(), "0.001");
+        assert_eq!(
+            instrument.min_order_quantity.as_ref().unwrap().as_str(),
+            "0.001"
+        );
+        assert_eq!(instrument.min_notional.as_ref().unwrap().as_str(), "5");
         assert_eq!(instrument.max_leverage.as_ref().unwrap().as_str(), "100.00");
         assert_eq!(instrument.listing_time_ms, Some(1_584_230_400_000));
         assert_eq!(instrument.expiry_time_ms, None);
@@ -1266,7 +1612,8 @@ mod tests {
                     "quantityPrecision": 3,
                     "filters": [
                         {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
-                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"},
                         {"filterType": "MARKET_LOT_SIZE", "stepSize": "0.001"}
                     ]
                 },
@@ -1298,6 +1645,11 @@ mod tests {
         let instrument = &instruments["BTCUSDT"];
         assert_eq!(instrument.tick_size.as_str(), "0.10");
         assert_eq!(instrument.quantity_step.as_str(), "0.001");
+        assert_eq!(
+            instrument.min_order_quantity.as_ref().unwrap().as_str(),
+            "0.001"
+        );
+        assert_eq!(instrument.min_notional.as_ref().unwrap().as_str(), "5");
         assert_eq!(instrument.settle_asset, "USDT");
         assert_eq!(instrument.expiry_time_ms, None);
     }
@@ -1350,6 +1702,7 @@ mod tests {
                     "ctValCcy": "BTC",
                     "tickSz": "0.1",
                     "lotSz": "0.01",
+                    "minSz": "0.01",
                     "lever": "100",
                     "listTime": "1573557408000",
                     "expTime": "",
@@ -1391,6 +1744,10 @@ mod tests {
         assert_eq!(instrument.settle_asset, "USDT");
         assert_eq!(instrument.contract_size.as_ref().unwrap().as_str(), "0.01");
         assert_eq!(instrument.contract_size_asset.as_deref(), Some("BTC"));
+        assert_eq!(
+            instrument.min_order_quantity.as_ref().unwrap().as_str(),
+            "0.01"
+        );
     }
 
     #[test]
@@ -1419,6 +1776,100 @@ mod tests {
         assert_eq!(
             instrument.capabilities.candle_1m_volume,
             CandleVolumeSupport::Unavailable
+        );
+    }
+
+    #[test]
+    fn parses_only_normal_mexc_usdt_perpetuals() {
+        let row = |symbol: &str, state: i64, contract_state: i64| {
+            json!({
+                "symbol": symbol,
+                "baseCoin": "FET",
+                "quoteCoin": "USDT",
+                "settleCoin": "USDT",
+                "futureType": 1,
+                "state": state,
+                "type": contract_state,
+                "preMarket": false,
+                "contractSize": 10,
+                "priceUnit": 0.0001,
+                "volUnit": 1,
+                "minVol": 1,
+                "maxLeverage": 200,
+                "createTime": 1_700_000_000_000_u64,
+                "openingTime": 1_700_000_060_000_u64
+            })
+        };
+        let body = json!({
+            "success": true,
+            "code": 0,
+            "data": [
+                row("FET_USDT", 0, 1),
+                row("SUSPENDED_USDT", 0, 2),
+                row("OFFLINE_USDT", 3, 1)
+            ]
+        })
+        .to_string();
+
+        let instruments = parse_mexc_catalog(&body).unwrap();
+
+        assert_eq!(instruments.len(), 1);
+        let instrument = &instruments["FET_USDT"];
+        assert_eq!(instrument.instrument_id, "mexc:linear_perpetual:FET_USDT");
+        assert_eq!(instrument.contract_size.as_ref().unwrap().as_str(), "10");
+        assert_eq!(instrument.quantity_step.as_str(), "1");
+        assert_eq!(
+            instrument.min_order_quantity.as_ref().unwrap().as_str(),
+            "1"
+        );
+        assert_eq!(instrument.listing_time_ms, Some(1_700_000_060_000));
+        assert_eq!(
+            instrument.capabilities.candle_1m_finality,
+            CandleFinalitySupport::Unknown
+        );
+    }
+
+    #[test]
+    fn parses_api_enabled_bingx_contracts_and_precision_steps() {
+        let row = |symbol: &str, api_state_open: &str| {
+            json!({
+                "symbol": symbol,
+                "asset": "FET",
+                "currency": "USDT",
+                "status": 1,
+                "apiStateOpen": api_state_open,
+                "size": "1",
+                "pricePrecision": 4,
+                "quantityPrecision": 0,
+                "tradeMinQuantity": 15,
+                "tradeMinUSDT": 2,
+                "launchTime": 1_736_928_000_000_u64,
+                "offTime": 0
+            })
+        };
+        let body = json!({
+            "code": 0,
+            "msg": "",
+            "data": [row("FET-USDT", "true"), row("CLOSED-USDT", "false")]
+        })
+        .to_string();
+
+        let instruments = parse_bingx_catalog(&body).unwrap();
+
+        assert_eq!(instruments.len(), 1);
+        let instrument = &instruments["FET-USDT"];
+        assert_eq!(instrument.instrument_id, "bingx:linear_perpetual:FET-USDT");
+        assert_eq!(instrument.tick_size.as_str(), "0.0001");
+        assert_eq!(instrument.quantity_step.as_str(), "1");
+        assert_eq!(instrument.contract_size_asset.as_deref(), Some("FET"));
+        assert_eq!(
+            instrument.min_order_quantity.as_ref().unwrap().as_str(),
+            "15"
+        );
+        assert_eq!(instrument.min_notional.as_ref().unwrap().as_str(), "2");
+        assert_eq!(
+            instrument.capabilities.candle_1m_finality,
+            CandleFinalitySupport::Unknown
         );
     }
 
@@ -1646,7 +2097,11 @@ mod tests {
             "launchTime": "1584230400000",
             "deliveryTime": "0",
             "priceFilter": {"tickSize": "0.10"},
-            "lotSizeFilter": {"qtyStep": "0.001"},
+            "lotSizeFilter": {
+                "qtyStep": "0.001",
+                "minOrderQty": "0.001",
+                "minNotionalValue": "5"
+            },
             "leverageFilter": {"maxLeverage": "100.00"}
         })
     }
