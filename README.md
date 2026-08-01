@@ -1,16 +1,17 @@
 # Market Stream Gateway
 
 A demand-driven Rust service that exposes public derivatives market data from Bybit, Binance,
-OKX, and KuCoin through one versioned contract. The wire format is provider-neutral rather than a
-copy of Bybit's protocol: provider and exact venue symbol remain explicit, decimals remain lossless
-strings, and no adapter invents missing prices, volume, finality, or sequence numbers.
+OKX, KuCoin, MEXC, and BingX through one versioned contract. The wire format is provider-neutral
+rather than a copy of Bybit's protocol: provider and exact venue symbol remain explicit, decimals
+remain lossless strings, and no adapter invents missing prices, volume, finality, or sequence
+numbers.
 
-This repository is local-only for its initial release. Axion Trading Core still uses its existing
-Bybit clients; nothing here deploys or changes production.
+This repository is local-only for its initial release. Axion Trading Core has a local feature
+branch that consumes this contract, but nothing here deploys or changes production.
 
 ## V1 capabilities
 
-- Linear perpetual tickers and one-minute candles from all four providers.
+- Linear perpetual tickers and one-minute candles from all six providers.
 - Exact live-instrument discovery with lifecycle, tick/quantity, contract, and capability metadata.
 - Bounded historical one-minute candle retrieval for bootstrap and gap repair.
 - Shared upstream demand, dynamic native subscriptions, acknowledgement correlation, heartbeats,
@@ -51,7 +52,7 @@ curl "http://127.0.0.1:8080/v1/instruments?provider=okx&symbol=BTC-USDT-SWAP"
 ```
 
 Use `MSG_PROVIDERS=none` for an offline process/container smoke, or a comma-separated subset such
-as `bybit,okx`. Public provider endpoints need no API credentials.
+as `bybit,mexc,bingx`. Public provider endpoints need no API credentials.
 
 ```console
 docker compose up --build
@@ -83,6 +84,10 @@ subscription. Upstream-native acknowledgement is reflected by endpoint readiness
 claimed by the client command ACK. Consumers must wait for the route to become ready and process
 `gap` or reconnect events by repairing candle history.
 
+The default per-provider limit is 60 channel subscriptions. A Worker route uses ticker plus
+one-minute candle channels, so the default safely admits 30 active routes per provider; the `hello`
+frame advertises the configured limits before any subscription command is sent.
+
 Every provider emits the same event envelope:
 
 ```json
@@ -113,17 +118,20 @@ loss only within one `stream_epoch`.
 
 ## Trading Core migration boundary
 
-The worker cutover is deliberately not part of this repository. The safe follow-up is to add a
-provider-neutral Core client, extend every runtime/persistence key from symbol-only to
-provider+market+venue-symbol, and run Bybit through the gateway in shadow mode before changing an
-authoritative write. The conversion must accumulate ticker fields by their own `observed_at_ms`,
-wait for genuine last and mark prices, convert candle end from exclusive to Core's inclusive end,
-and accept only `closed` authoritative candles. Venue choice, catalog evidence, and resolver
-version must be frozen on each trade; an active trade must never silently move exchanges.
+The local Trading Core integration uses provider+market+venue-symbol route keys, accumulates sparse
+ticker fields by their own `observed_at_ms`, waits for genuine last and mark prices, converts candle
+end from exclusive to Core's inclusive end, and accepts only `closed` authoritative candles. Venue
+choice, catalog evidence, and resolver version are frozen on each trade so an active trade never
+silently moves exchanges.
 
-KuCoin V1 candles remain informational because the provider documents unreliable futures volume
-and exposes no explicit close flag. No production worker or VPS service should use this gateway
-until the shadow comparison, gap repair, provider-scoped readiness, and rollback path are complete.
+KuCoin, MEXC, and BingX V1 stream candles remain informational because their public futures feeds
+do not provide a reliable explicit close flag; KuCoin also lacks reliable futures volume. Their
+REST history uses public server time to classify completed intervals. The Core resolver therefore
+requires ticker support plus authoritative one-minute history and at least one trustworthy history
+volume dimension. MEXC and BingX qualify for fallback through REST reconciliation, while KuCoin
+remains ineligible for authoritative persistence. No production worker or VPS service should use
+this gateway until the local integration is reviewed and a production rollout is explicitly
+approved.
 
 ## Validation
 
