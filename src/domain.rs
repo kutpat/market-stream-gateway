@@ -45,6 +45,7 @@ impl fmt::Display for MarketKind {
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
     Ticker,
+    #[serde(rename = "candle_1m")]
     Candle1m,
 }
 
@@ -211,6 +212,55 @@ impl Ticker {
             || self.bid.is_some()
             || self.ask.is_some()
     }
+
+    /// Validate portable price invariants after provider normalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-positive prices, zero observation times, or a crossed best bid
+    /// and ask. Funding rates are intentionally allowed to be negative.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        for (name, observation) in [
+            ("last", self.last.as_ref()),
+            ("mark", self.mark.as_ref()),
+            ("index", self.index.as_ref()),
+            ("bid", self.bid.as_ref()),
+            ("ask", self.ask.as_ref()),
+        ] {
+            if let Some(observation) = observation {
+                if observation.observed_at_ms == 0 {
+                    return Err(DomainError::InvalidMarketData(format!(
+                        "{name} observation timestamp must be positive"
+                    )));
+                }
+                if decimal(&observation.value)? <= Decimal::ZERO {
+                    return Err(DomainError::InvalidMarketData(format!(
+                        "{name} price must be positive"
+                    )));
+                }
+            }
+        }
+        if let Some(funding) = &self.funding_rate
+            && funding.observed_at_ms == 0
+        {
+            return Err(DomainError::InvalidMarketData(
+                "funding observation timestamp must be positive".to_owned(),
+            ));
+        }
+        if let (Some(bid), Some(ask)) = (&self.bid, &self.ask)
+            && decimal(&bid.value)? > decimal(&ask.value)?
+        {
+            return Err(DomainError::InvalidMarketData(
+                "best bid must not exceed best ask".to_owned(),
+            ));
+        }
+        if !self.has_price() {
+            return Err(DomainError::InvalidMarketData(
+                "ticker must contain at least one price".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +298,55 @@ pub struct Candle {
     pub data_quality: Vec<DataQuality>,
 }
 
+impl Candle {
+    /// Validate one-minute candle price, duration, and quantity invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when prices are non-positive, OHLC bounds conflict, the interval is not
+    /// exactly one minute, or a reported volume is negative.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.interval != "1m" || self.end_time_ms.checked_sub(self.start_time_ms) != Some(60_000)
+        {
+            return Err(DomainError::InvalidMarketData(
+                "candle must cover exactly one minute".to_owned(),
+            ));
+        }
+        let open = decimal(&self.open)?;
+        let high = decimal(&self.high)?;
+        let low = decimal(&self.low)?;
+        let close = decimal(&self.close)?;
+        if [open, high, low, close]
+            .into_iter()
+            .any(|value| value <= Decimal::ZERO)
+        {
+            return Err(DomainError::InvalidMarketData(
+                "candle prices must be positive".to_owned(),
+            ));
+        }
+        if high < open || high < close || high < low || low > open || low > close {
+            return Err(DomainError::InvalidMarketData(
+                "candle OHLC bounds are inconsistent".to_owned(),
+            ));
+        }
+        for volume in [
+            self.base_volume.as_ref(),
+            self.quote_volume.as_ref(),
+            self.contract_volume.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if decimal(volume)? < Decimal::ZERO {
+                return Err(DomainError::InvalidMarketData(
+                    "candle volume must not be negative".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSequence {
@@ -271,6 +370,18 @@ impl MarketPayload {
         match self {
             Self::Ticker(_) => Channel::Ticker,
             Self::Candle(_) => Channel::Candle1m,
+        }
+    }
+
+    /// Validate common invariants that every provider adapter must preserve.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the normalized ticker or candle is economically invalid.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        match self {
+            Self::Ticker(ticker) => ticker.validate(),
+            Self::Candle(candle) => candle.validate(),
         }
     }
 }
@@ -305,20 +416,72 @@ impl MarketEvent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderEvent {
+    pub connection_epoch: Uuid,
+    pub provider: Provider,
+    pub market: MarketKind,
+    pub symbol: String,
+    pub exchange_time_ms: Option<u64>,
+    pub gateway_received_time_ms: u64,
+    pub source_sequence: Option<SourceSequence>,
+    pub payload: MarketPayload,
+}
+
+impl ProviderEvent {
+    pub fn into_market_event(self, stream_epoch: Uuid, delivery_sequence: u64) -> MarketEvent {
+        let instrument_id = format!("{}:{}:{}", self.provider, self.market, self.symbol);
+        MarketEvent {
+            schema_version: SCHEMA_VERSION,
+            stream_epoch,
+            delivery_sequence,
+            connection_epoch: self.connection_epoch,
+            instrument_id,
+            provider: self.provider,
+            market: self.market,
+            symbol: self.symbol,
+            exchange_time_ms: self.exchange_time_ms,
+            gateway_received_time_ms: self.gateway_received_time_ms,
+            source_sequence: self.source_sequence,
+            payload: self.payload,
+        }
+    }
+
+    /// Validate normalized payload and timestamp invariants before fan-out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider event has no receive time or its payload is invalid.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.gateway_received_time_ms == 0 {
+            return Err(DomainError::InvalidMarketData(
+                "gateway receive timestamp must be positive".to_owned(),
+            ));
+        }
+        self.payload.validate()
+    }
+}
+
+fn decimal(value: &DecimalValue) -> Result<Decimal, DomainError> {
+    Decimal::from_str(value.as_str())
+        .map_err(|_| DomainError::InvalidDecimal(value.as_str().to_owned()))
+}
+
 /// Normalize a venue symbol for identity and subscription matching.
 ///
 /// # Errors
 ///
-/// Returns [`DomainError::InvalidSymbol`] when the symbol is empty, longer than 64 bytes, or
-/// contains characters outside the supported venue-symbol alphabet.
+/// Returns [`DomainError::InvalidSymbol`] when the symbol is empty, longer than 64 UTF-8 bytes,
+/// or contains characters outside the supported venue-symbol alphabet. Unicode letters and
+/// numbers are accepted because some venues list contracts with non-ASCII base assets.
 pub fn normalize_symbol(symbol: &str) -> Result<String, DomainError> {
     let symbol = symbol.trim();
     if symbol.is_empty() || symbol.len() > 64 {
         return Err(DomainError::InvalidSymbol(symbol.to_owned()));
     }
     if !symbol
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        .chars()
+        .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_' | '.'))
     {
         return Err(DomainError::InvalidSymbol(symbol.to_owned()));
     }
@@ -333,6 +496,8 @@ pub enum DomainError {
     NoChannels,
     #[error("invalid decimal value: {0}")]
     InvalidDecimal(String),
+    #[error("invalid normalized market data: {0}")]
+    InvalidMarketData(String),
 }
 
 #[cfg(test)]
@@ -364,10 +529,24 @@ mod tests {
     #[test]
     fn symbols_are_strictly_validated() {
         assert_eq!(normalize_symbol("ethusdt").unwrap(), "ETHUSDT");
+        assert_eq!(normalize_symbol("币安人生usdt").unwrap(), "币安人生USDT");
         assert!(matches!(
             normalize_symbol("BTC/USDT"),
             Err(DomainError::InvalidSymbol(_))
         ));
+    }
+
+    #[test]
+    fn one_minute_candle_channel_has_stable_wire_name() {
+        assert_eq!(
+            serde_json::to_value(Channel::Candle1m).unwrap(),
+            json!("candle_1m")
+        );
+        assert_eq!(
+            serde_json::from_value::<Channel>(json!("candle_1m")).unwrap(),
+            Channel::Candle1m
+        );
+        assert!(serde_json::from_value::<Channel>(json!("candle1m")).is_err());
     }
 
     #[test]
@@ -404,5 +583,31 @@ mod tests {
         assert_eq!(json["provider"], "binance");
         assert_eq!(json["data"]["last"]["value"], "42000.10");
         assert!(json["data"].get("bid").is_none());
+    }
+
+    #[test]
+    fn normalized_market_invariants_reject_bad_prices_and_candles() {
+        let crossed = Ticker {
+            bid: Some(ObservedDecimal::new("2", 1).unwrap()),
+            ask: Some(ObservedDecimal::new("1", 1).unwrap()),
+            ..Ticker::default()
+        };
+        assert!(crossed.validate().is_err());
+
+        let candle = Candle {
+            interval: "1m".to_owned(),
+            start_time_ms: 60_000,
+            end_time_ms: 120_000,
+            open: DecimalValue::new("10").unwrap(),
+            high: DecimalValue::new("9").unwrap(),
+            low: DecimalValue::new("8").unwrap(),
+            close: DecimalValue::new("8.5").unwrap(),
+            base_volume: None,
+            quote_volume: None,
+            contract_volume: None,
+            finality: CandleFinality::Closed,
+            data_quality: Vec::new(),
+        };
+        assert!(candle.validate().is_err());
     }
 }

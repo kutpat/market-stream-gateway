@@ -2,5 +2,6 @@
 
 pub mod domain;
 pub mod protocol;
+pub mod providers;
 
 pub const SERVICE_NAME: &str = "market-stream-gateway";
