@@ -35,6 +35,7 @@ pub enum ControlMessage {
         schema_version: u16,
         stream_epoch: String,
         max_subscriptions: usize,
+        max_provider_subscriptions: usize,
     },
     Ack {
         schema_version: u16,
@@ -61,11 +62,16 @@ pub enum ControlMessage {
 }
 
 impl ControlMessage {
-    pub fn hello(stream_epoch: impl Into<String>, max_subscriptions: usize) -> Self {
+    pub fn hello(
+        stream_epoch: impl Into<String>,
+        max_subscriptions: usize,
+        max_provider_subscriptions: usize,
+    ) -> Self {
         Self::Hello {
             schema_version: SCHEMA_VERSION,
             stream_epoch: stream_epoch.into(),
             max_subscriptions,
+            max_provider_subscriptions,
         }
     }
 
@@ -104,9 +110,10 @@ mod tests {
 
     #[test]
     fn control_messages_carry_schema_version() {
-        let message = ControlMessage::hello("epoch", 100);
+        let message = ControlMessage::hello("epoch", 100, 50);
         let value = serde_json::to_value(message).unwrap();
         assert_eq!(value["type"], "hello");
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
+        assert_eq!(value["max_provider_subscriptions"], 50);
     }
 }
