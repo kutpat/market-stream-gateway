@@ -87,10 +87,14 @@ claimed by the client command ACK. Consumers must wait for the route to become r
 
 Subscription ceilings are per provider, because the venues differ: some document a per-connection
 topic limit and some do not, so one global number is either too low for the permissive venues or
-unsafe for the strict ones. Each provider contributes its own ceiling, and the `hello` frame
-advertises them in `provider_subscription_limits` before any subscription command is sent. The
-scalar `max_provider_subscriptions` is retained as the minimum across enabled providers, so a client
-that reads only that value still cannot oversubscribe the strictest venue.
+unsafe for the strict ones. Each provider contributes its own ceiling.
+
+The `hello` frame reports `max_provider_subscriptions` as the **minimum** across enabled providers,
+so a client applying one number to every provider cannot oversubscribe the strictest venue. The
+exact per-provider map is deliberately not advertised: Trading Core validates this frame against a
+closed field set and refuses to connect on any field it does not recognise, so adding one is a
+breaking change rather than an additive one. Consumers must tolerate unknown fields before the frame
+can grow.
 
 `MSG_MAX_PROVIDER_SUBSCRIPTIONS` is an optional ceiling applied on top. It only ever tightens a
 limit: it cannot raise one past what a provider declared, since that declaration may be a venue
