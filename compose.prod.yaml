@@ -1,0 +1,79 @@
+# Market Stream Gateway production deployment.
+#
+# The release workflow copies this file to /root/axion/gateway together with a
+# .env that pins MARKET_GATEWAY_IMAGE. That directory is everything a Docker host
+# needs, so the same deploy works on any provider.
+#
+#   docker compose -p axion-gateway -f compose.prod.yaml up -d
+#
+# This service has no secrets. Every provider feed it reads is public and needs
+# no credentials, so unlike the other Axion services there is no host-only env
+# file: all configuration lives here, in review, instead of on the host.
+#
+# Hardening mirrors compose.yaml, which CI already smoke tests: non-root,
+# read-only root filesystem, all capabilities dropped, no new privileges.
+
+services:
+  market-gateway:
+    image: ${MARKET_GATEWAY_IMAGE:?MARKET_GATEWAY_IMAGE must be set to a pinned image reference}
+    container_name: axion-market-gateway
+    init: true
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    networks:
+      axion-trading:
+        aliases:
+          - market-gateway
+    # Loopback only. The gateway implements no authentication and no TLS by
+    # design, so it must never be reachable from outside the host. Trading Core
+    # reaches it over the shared network as http://axion-market-gateway:8080;
+    # this mapping exists so the host can curl it for diagnostics.
+    ports:
+      - "127.0.0.1:18070:8080"
+    environment:
+      # Must stay 0.0.0.0 inside the container. Binding container loopback would
+      # make both the published port and cross-container access fail while the
+      # process still looked healthy from inside -- the same failure the Core MCP
+      # server hit before TRADE_CONTEXT_MCP_HOST was set.
+      MSG_BIND: 0.0.0.0:8080
+      MSG_LOG_FORMAT: json
+      # Bybit only for now. /health/ready requires every *enabled* provider's
+      # catalogue to have refreshed successfully, so enabling a venue before
+      # anything consumes it just adds ways for the container to report
+      # unhealthy. Widen this when Core is ready to resolve that venue.
+      MSG_PROVIDERS: bybit
+      # Browser origins stay denied: MSG_ALLOWED_ORIGINS is deliberately unset.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/market-stream-healthcheck"]
+      interval: 10s
+      timeout: 4s
+      start_period: 10s
+      retries: 3
+    stop_grace_period: 15s
+    pids_limit: 128
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    # Matches the development limit. Revisit when more providers are enabled:
+    # each venue holds a catalogue snapshot, and the largest are ~1k instruments.
+    mem_limit: 256m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  # Owned by the Trading Core deployment. Declared external so this project
+  # joins it rather than creating a second, isolated network.
+  axion-trading:
+    external: true
