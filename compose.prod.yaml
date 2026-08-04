@@ -52,12 +52,15 @@ services:
       #
       # Binance carries six of the seven symbols Bybit never listed, which is the
       # entire coverage case for a second venue.
-      # OKX is authoritative on both stream and history like Bybit and Binance,
-      # but it is the first venue that splits channels across two endpoints:
-      # tickers on the public socket, candles on the business one. Both must be
-      # connected for it to be ready, so it contributes two readiness endpoints
-      # rather than one.
-      MSG_PROVIDERS: bybit,binance,okx
+      # Only venues a consumer actually resolves against. Readiness requires
+      # every enabled provider's catalogue, so an enabled-but-unused venue is
+      # nothing but an extra way for this container to report unhealthy.
+      #
+      # OKX was enabled briefly and withdrawn: Trading Core cannot resolve to it
+      # because OKX swaps are priced in contracts and nothing there reads
+      # contract_size. Re-enable it in the same commit that gives Core that
+      # support, not before.
+      MSG_PROVIDERS: bybit,binance
       # Browser origins stay denied: MSG_ALLOWED_ORIGINS is deliberately unset.
     healthcheck:
       test: ["CMD", "/usr/local/bin/market-stream-healthcheck"]
