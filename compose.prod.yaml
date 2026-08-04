@@ -44,11 +44,15 @@ services:
       # server hit before TRADE_CONTEXT_MCP_HOST was set.
       MSG_BIND: 0.0.0.0:8080
       MSG_LOG_FORMAT: json
-      # Bybit only for now. /health/ready requires every *enabled* provider's
-      # catalogue to have refreshed successfully, so enabling a venue before
-      # anything consumes it just adds ways for the container to report
-      # unhealthy. Widen this when Core is ready to resolve that venue.
-      MSG_PROVIDERS: bybit
+      # /health/ready requires every *enabled* provider's catalogue to have
+      # refreshed successfully, so a venue enabled here is a venue this container
+      # reports unhealthy without. Widen this before the consumer names the same
+      # venue, never after: Trading Core fails its whole instrument sync if it
+      # names a provider the gateway is not serving.
+      #
+      # Binance carries six of the seven symbols Bybit never listed, which is the
+      # entire coverage case for a second venue.
+      MSG_PROVIDERS: bybit,binance
       # Browser origins stay denied: MSG_ALLOWED_ORIGINS is deliberately unset.
     healthcheck:
       test: ["CMD", "/usr/local/bin/market-stream-healthcheck"]
