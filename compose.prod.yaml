@@ -52,7 +52,12 @@ services:
       #
       # Binance carries six of the seven symbols Bybit never listed, which is the
       # entire coverage case for a second venue.
-      MSG_PROVIDERS: bybit,binance
+      # OKX is authoritative on both stream and history like Bybit and Binance,
+      # but it is the first venue that splits channels across two endpoints:
+      # tickers on the public socket, candles on the business one. Both must be
+      # connected for it to be ready, so it contributes two readiness endpoints
+      # rather than one.
+      MSG_PROVIDERS: bybit,binance,okx
       # Browser origins stay denied: MSG_ALLOWED_ORIGINS is deliberately unset.
     healthcheck:
       test: ["CMD", "/usr/local/bin/market-stream-healthcheck"]
