@@ -14,6 +14,15 @@ pub mod kucoin;
 pub mod mexc;
 pub mod okx;
 
+/// Default channel-subscription capacity for one provider.
+///
+/// This is a local resource guard, not a venue rule. Individual commands are
+/// already bounded by each adapter's per-command topic/argument limits and by
+/// `ConnectionTarget::max_message_bytes`; this bounds how much total demand one
+/// provider may accumulate. Providers whose venue documents a per-connection
+/// ceiling override [`ProviderAdapter::max_subscriptions`] with that ceiling.
+pub const DEFAULT_MAX_PROVIDER_SUBSCRIPTIONS: usize = 1_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EndpointKind {
     Primary,
@@ -78,6 +87,18 @@ pub trait ProviderAdapter: Send + Sync {
     fn endpoints(&self) -> &'static [EndpointKind];
 
     fn endpoint_for(&self, channel: Channel) -> EndpointKind;
+
+    /// Maximum channel subscriptions the gateway will hold for this provider.
+    ///
+    /// Override this where the venue documents a per-connection ceiling, so the
+    /// gateway refuses demand it could not honour rather than letting the venue
+    /// silently drop topics. Otherwise the default resource guard applies. A
+    /// provider that spreads channels over several endpoints, as OKX does, is
+    /// counted conservatively: the limit applies to the provider total rather
+    /// than to each of its connections.
+    fn max_subscriptions(&self) -> usize {
+        DEFAULT_MAX_PROVIDER_SUBSCRIPTIONS
+    }
 
     async fn connection_target(
         &self,
