@@ -6,8 +6,9 @@ rather than a copy of Bybit's protocol: provider and exact venue symbol remain e
 remain lossless strings, and no adapter invents missing prices, volume, finality, or sequence
 numbers.
 
-This repository is local-only for its initial release. Axion Trading Core has a local feature
-branch that consumes this contract, but nothing here deploys or changes production.
+Nothing consumes this service in production yet. Axion Trading Core has a local feature branch that
+reads this contract; until that lands, the gateway can be deployed and observed without affecting
+anything.
 
 ## V1 capabilities
 
@@ -139,6 +140,65 @@ volume dimension. MEXC and BingX qualify for fallback through REST reconciliatio
 remains ineligible for authoritative persistence. No production worker or VPS service should use
 this gateway until the local integration is reviewed and a production rollout is explicitly
 approved.
+
+## Deployment
+
+Pushing to `main` validates the change and publishes an image. Publishing a GitHub Release deploys
+it. A push never deploys.
+
+| Event | Workflow | Effect |
+| --- | --- | --- |
+| Pull request | `ci.yml` | Format, clippy, tests, docs, image build plus the hardened container smoke. Nothing is pushed or deployed. |
+| Push to `main` | `ci.yml` | Same checks, then pushes `ghcr.io/kutpat/market-stream-gateway:sha-<full-sha>` and `:main`. **No deploy.** |
+| Release published | `release.yml` | Retags the already-tested `sha-<sha>` image as `:<tag>` and deploys it. |
+| Manual `workflow_dispatch` | `release.yml` | Same deploy for any other published release tag: redeploys or rolls back. |
+
+A release never rebuilds. It promotes the exact image CI smoke tested, so the bytes in production are
+the bytes that passed the gates. Naming a commit CI never built on `main` fails with that reason
+rather than building something unverified.
+
+```console
+gh release create v0.1.0 --target main --generate-notes
+gh workflow run release.yml -f tag=v0.1.0   # redeploy or roll back
+```
+
+The deploy directory holds no source checkout and, uniquely among the Axion services, **no secrets**:
+
+```
+/root/axion/gateway/
+  compose.prod.yaml   uploaded by the release workflow
+  .env                MARKET_GATEWAY_IMAGE pin, written by the release workflow
+```
+
+Every provider feed is public, so there is no credential to place on the host and no env file to
+maintain. Configuration lives in `compose.prod.yaml` where it can be reviewed.
+
+The container joins the external `axion-trading` Docker network and is reached by consumers as
+`http://axion-market-gateway:8080`. Port `18070` is published on host loopback only, for diagnostics:
+the gateway implements no authentication and no TLS, so it must never be exposed beyond the host.
+
+`MSG_PROVIDERS` is set to `bybit` alone for now. `/health/ready` requires every *enabled* provider's
+catalogue to have refreshed successfully, so enabling a venue before anything consumes it only adds
+ways for the container to report unhealthy.
+
+### One-time host preparation
+
+Required once per host, and already satisfied on a host running Trading Core:
+
+- Docker with the Compose v2 plugin.
+- The `axion-trading` network. Core's deployment creates it; elsewhere run
+  `docker network create axion-trading`.
+- Repository secrets `HOST`, `USERNAME`, and `SSH_PRIVATE_KEY`, plus optional
+  `DISCORD_DEPLOY_WEBHOOK_URL`. The host stores no registry credential: the deploy logs in to GHCR
+  with the workflow's own job token and logs out on the way out.
+
+Inspect production with:
+
+```console
+docker compose -p axion-gateway -f /root/axion/gateway/compose.prod.yaml ps
+docker logs --tail 100 axion-market-gateway
+curl -s http://127.0.0.1:18070/health/ready
+```
 
 ## Validation
 
