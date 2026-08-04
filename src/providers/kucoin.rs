@@ -63,6 +63,12 @@ impl ProviderAdapter for KucoinAdapter {
         EndpointKind::Primary
     }
 
+    fn max_subscriptions(&self) -> usize {
+        // Conservative: reuse the documented per-command topic bound, the
+        // tightest limit verified for KuCoin Classic Futures here.
+        TOPICS_PER_COMMAND
+    }
+
     async fn connection_target(
         &self,
         endpoint: EndpointKind,

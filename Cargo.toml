@@ -6,6 +6,9 @@ rust-version = "1.97"
 description = "Provider-neutral cryptocurrency market stream gateway"
 license = "UNLICENSED"
 publish = false
+# Without this, the healthcheck binary makes `cargo run` ambiguous and every
+# documented run command fails before it starts.
+default-run = "market-stream-gateway"
 
 [dependencies]
 anyhow = "1.0"

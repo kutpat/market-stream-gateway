@@ -9,17 +9,17 @@ use market_stream_gateway::api::{AppState, router};
 use market_stream_gateway::catalog::{Catalog, CatalogError, CatalogSources, RefreshOutcome};
 use market_stream_gateway::config::{LogFormat, Settings};
 use market_stream_gateway::domain::Provider;
-use market_stream_gateway::gateway::{GatewayHub, SubscriptionRegistry};
+use market_stream_gateway::gateway::{GatewayHub, ProviderLimits, SubscriptionRegistry};
 use market_stream_gateway::health::HealthRegistry;
 use market_stream_gateway::history::{HistoryClient, HistorySources};
 use market_stream_gateway::metrics::{Metrics, ProviderLabels};
-use market_stream_gateway::providers::ProviderAdapter;
 use market_stream_gateway::providers::binance::BinanceAdapter;
 use market_stream_gateway::providers::bingx::BingxAdapter;
 use market_stream_gateway::providers::bybit::BybitAdapter;
 use market_stream_gateway::providers::kucoin::KucoinAdapter;
 use market_stream_gateway::providers::mexc::MexcAdapter;
 use market_stream_gateway::providers::okx::OkxAdapter;
+use market_stream_gateway::providers::{DEFAULT_MAX_PROVIDER_SUBSCRIPTIONS, ProviderAdapter};
 use market_stream_gateway::runtime::{RuntimeContext, spawn_provider_supervisors};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -41,9 +41,9 @@ async fn main() -> anyhow::Result<()> {
         settings.downstream_buffer,
         settings.max_downstream_clients,
     ));
-    let subscriptions = Arc::new(SubscriptionRegistry::with_provider_limit(
+    let subscriptions = Arc::new(SubscriptionRegistry::with_provider_limits(
         settings.max_client_subscriptions,
-        settings.max_provider_subscriptions,
+        provider_limits(&adapters, settings.max_provider_subscriptions),
     ));
     let health = Arc::new(HealthRegistry::default());
     let metrics = Arc::new(Metrics::new());
@@ -126,6 +126,25 @@ async fn main() -> anyhow::Result<()> {
         error!(%error, "background_task_monitor_failed");
     }
     server_result.context("serve gateway HTTP API")
+}
+
+/// Collect each enabled provider's declared subscription capacity.
+///
+/// `override_ceiling` can only tighten what a provider declared, so an operator
+/// cannot configure the gateway past a venue rule.
+fn provider_limits(
+    adapters: &[Arc<dyn ProviderAdapter>],
+    override_ceiling: Option<usize>,
+) -> ProviderLimits {
+    let limits = adapters
+        .iter()
+        .map(|adapter| (adapter.provider(), adapter.max_subscriptions()))
+        .collect::<BTreeMap<_, _>>();
+    let limits = ProviderLimits::new(limits, DEFAULT_MAX_PROVIDER_SUBSCRIPTIONS);
+    match override_ceiling {
+        Some(ceiling) => limits.capped_at(ceiling),
+        None => limits,
+    }
 }
 
 fn configured_adapters(
