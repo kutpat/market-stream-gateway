@@ -84,9 +84,16 @@ subscription. Upstream-native acknowledgement is reflected by endpoint readiness
 claimed by the client command ACK. Consumers must wait for the route to become ready and process
 `gap` or reconnect events by repairing candle history.
 
-The default per-provider limit is 60 channel subscriptions. A Worker route uses ticker plus
-one-minute candle channels, so the default safely admits 30 active routes per provider; the `hello`
-frame advertises the configured limits before any subscription command is sent.
+Subscription ceilings are per provider, because the venues differ: some document a per-connection
+topic limit and some do not, so one global number is either too low for the permissive venues or
+unsafe for the strict ones. Each provider contributes its own ceiling, and the `hello` frame
+advertises them in `provider_subscription_limits` before any subscription command is sent. The
+scalar `max_provider_subscriptions` is retained as the minimum across enabled providers, so a client
+that reads only that value still cannot oversubscribe the strictest venue.
+
+`MSG_MAX_PROVIDER_SUBSCRIPTIONS` is an optional ceiling applied on top. It only ever tightens a
+limit: it cannot raise one past what a provider declared, since that declaration may be a venue
+rule.
 
 Every provider emits the same event envelope:
 

@@ -285,7 +285,7 @@ async fn client_session(mut socket: WebSocket, state: AppState) {
     let hello = ControlMessage::hello(
         state.hub.stream_epoch().to_string(),
         state.subscriptions.max_subscriptions_per_client(),
-        state.subscriptions.max_subscriptions_per_provider(),
+        state.subscriptions.provider_limits(),
     );
     if !send_json(&mut socket, &hello).await {
         cleanup_session(&state, client_id).await;

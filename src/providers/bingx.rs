@@ -69,6 +69,12 @@ impl ProviderAdapter for BingxAdapter {
         EndpointKind::Primary
     }
 
+    fn max_subscriptions(&self) -> usize {
+        // BingX documents a per-connection topic ceiling, so this is a venue
+        // rule rather than a local guard.
+        BINGX_MAX_TOPICS_PER_CONNECTION
+    }
+
     async fn connection_target(
         &self,
         endpoint: EndpointKind,
