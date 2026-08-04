@@ -1,8 +1,6 @@
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Provider, SCHEMA_VERSION, Subscription, SubscriptionKey};
+use crate::domain::{SCHEMA_VERSION, Subscription, SubscriptionKey};
 use crate::gateway::ProviderLimits;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -40,13 +38,18 @@ pub enum ControlMessage {
         max_subscriptions: usize,
         /// The ceiling that is safe to apply uniformly to every provider.
         ///
-        /// Retained so a client that predates `provider_subscription_limits`
-        /// still cannot oversubscribe the strictest venue. It is the minimum of
-        /// the per-provider limits, so it understates capacity for permissive
-        /// venues; prefer the map below.
+        /// This is the minimum of the per-provider limits, so a client that
+        /// applies one number to every provider cannot oversubscribe the
+        /// strictest venue. It understates capacity for permissive ones.
+        ///
+        /// A per-provider map was briefly advertised alongside this and had to be
+        /// withdrawn: Trading Core validates the frame with a closed field set and
+        /// rejects any field it does not know, so adding one stopped its market
+        /// worker from connecting at all. Any future field here must wait until
+        /// every deployed consumer tolerates unknown fields. Adding to a frame is
+        /// only backwards compatible if the readers are lenient, and these were
+        /// not.
         max_provider_subscriptions: usize,
-        /// Exact ceiling per enabled provider.
-        provider_subscription_limits: BTreeMap<Provider, usize>,
     },
     Ack {
         schema_version: u16,
@@ -83,7 +86,6 @@ impl ControlMessage {
             stream_epoch: stream_epoch.into(),
             max_subscriptions,
             max_provider_subscriptions: provider_limits.minimum(),
-            provider_subscription_limits: provider_limits.entries().clone(),
         }
     }
 
@@ -110,9 +112,12 @@ pub enum ErrorCode {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use serde_json::json;
 
     use super::*;
+    use crate::domain::Provider;
 
     #[test]
     fn commands_reject_unknown_fields() {
@@ -130,17 +135,35 @@ mod tests {
     }
 
     #[test]
-    fn hello_advertises_per_provider_limits_and_a_safe_uniform_scalar() {
+    fn hello_reports_the_strictest_provider_limit_and_no_other_fields() {
         let limits = ProviderLimits::new(
             BTreeMap::from([(Provider::Bybit, 1_000), (Provider::Bingx, 200)]),
             1_000,
         );
         let value = serde_json::to_value(ControlMessage::hello("epoch", 512, &limits)).unwrap();
 
-        assert_eq!(value["provider_subscription_limits"]["bybit"], 1_000);
-        assert_eq!(value["provider_subscription_limits"]["bingx"], 200);
-        // The scalar is the minimum, so a client that only reads it cannot
-        // oversubscribe the strictest venue.
+        // The scalar is the minimum, so a client applying one number to every
+        // provider cannot oversubscribe the strictest venue.
         assert_eq!(value["max_provider_subscriptions"], 200);
+
+        // The field set is frozen. Trading Core validates this frame against a
+        // closed set and refuses to connect on anything it does not recognise, so
+        // an extra field here is a breaking change, not an additive one.
+        let fields = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "type",
+                "schema_version",
+                "stream_epoch",
+                "max_subscriptions",
+                "max_provider_subscriptions",
+            ])
+        );
     }
 }
