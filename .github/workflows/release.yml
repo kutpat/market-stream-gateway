@@ -123,6 +123,16 @@ jobs:
             # This service needs no env file and no credentials, so there is
             # nothing else to check: every provider feed it reads is public.
 
+            # Snapshot the compose file before the upload overwrites it: rolling
+            # back only the image pin can leave one release's compose paired with
+            # another's image. That bit Trading Core once, where the older compose
+            # lacked settings the newer image needed and it crash-looped.
+            if [ -f "$DEPLOY_DIR/compose.prod.yaml" ]; then
+              cp "$DEPLOY_DIR/compose.prod.yaml" "$DEPLOY_DIR/.compose.prod.yaml.previous"
+            else
+              rm -f "$DEPLOY_DIR/.compose.prod.yaml.previous"
+            fi
+
       - name: Upload compose file
         uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1
         with:
@@ -139,12 +149,15 @@ jobs:
           DEPLOY_IMAGE: ${{ env.IMAGE_NAME }}:${{ env.TAG }}
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # True only for a manual dispatch, which suppresses the automatic
+          # restore of the previously running image. See finish() below.
+          MANUAL_DEPLOY: ${{ github.event_name == 'workflow_dispatch' }}
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: 22
-          envs: DEPLOY_DIR,COMPOSE_PROJECT,CONTAINER,HEALTH_URL,DEPLOY_IMAGE,GHCR_USER,GHCR_TOKEN
+          envs: DEPLOY_DIR,COMPOSE_PROJECT,CONTAINER,HEALTH_URL,DEPLOY_IMAGE,GHCR_USER,GHCR_TOKEN,MANUAL_DEPLOY
           script: |
             set -eu
 
@@ -169,12 +182,30 @@ jobs:
               fi
               echo "Rolling back to $PREVIOUS_IMAGE"
               printf 'MARKET_GATEWAY_IMAGE=%s\n' "$PREVIOUS_IMAGE" > .env
+              # The compose file has to go back with the image. Restoring only the
+              # pin can pair one release's compose with another's image.
+              if [ -f .compose.prod.yaml.previous ]; then
+                cp .compose.prod.yaml.previous compose.prod.yaml
+                echo "Restored the compose file that shipped with $PREVIOUS_IMAGE"
+              fi
               compose up -d --force-recreate
             }
             finish() {
               code=$?
               if [ "$DEPLOY_OK" -eq 0 ] && [ "$SWITCHED" -eq 1 ]; then
-                rollback || true
+                # A manual dispatch is an operator deliberately choosing a tag,
+                # very often to escape the image that is running. Restoring that
+                # image is then the opposite of the instruction. Leave the
+                # requested state in place and report it; whoever dispatched the
+                # run is watching and can decide.
+                if [ "${MANUAL_DEPLOY:-false}" = "true" ]; then
+                  echo "Deploy of $DEPLOY_IMAGE failed."
+                  echo "This run was dispatched manually, so the stack is left on"
+                  echo "the tag you asked for rather than restored to"
+                  echo "$PREVIOUS_IMAGE. Dispatch another tag to change it."
+                else
+                  rollback || true
+                fi
               fi
               # Registry auth is ephemeral by design; never leave it behind.
               # The trap is not cleared on success, or this would be skipped.
