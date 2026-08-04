@@ -1,0 +1,314 @@
+name: Release deploy
+
+# Publishing a GitHub Release is the only thing that reaches production.
+# workflow_dispatch redeploys or rolls back to any other published release tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag to deploy or roll back to, e.g. v1.2.3"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: market-gateway-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/kutpat/market-stream-gateway
+  DEPLOY_DIR: /root/axion/gateway
+  COMPOSE_PROJECT: axion-gateway
+  CONTAINER: axion-market-gateway
+  HEALTH_URL: http://127.0.0.1:18070/health/ready
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_DEPLOY_WEBHOOK_URL }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify the tag is a published release and resolve its commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # A manual redeploy must still name a published release, so production
+          # can only ever run a commit that was released deliberately.
+          gh release view "$TAG" --json isDraft -q '.isDraft' | grep -qx false
+          SHA="$(git rev-parse HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote the CI-tested image to the release tag
+        id: promote
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -eu
+          if ! docker manifest inspect "$IMAGE_NAME:sha-$SHA" >/dev/null 2>&1; then
+            echo "::error::No image $IMAGE_NAME:sha-$SHA exists."
+            echo "A release can only deploy a commit that CI already built and"
+            echo "pushed from main. Merge the commit to main, wait for CI, then"
+            echo "re-run this deploy."
+            exit 1
+          fi
+          # Retag rather than rebuild, so the deployed bytes are exactly the
+          # bytes CI tested.
+          docker buildx imagetools create --tag "$IMAGE_NAME:$TAG" "$IMAGE_NAME:sha-$SHA"
+          DIGEST="$(docker buildx imagetools inspect "$IMAGE_NAME:$TAG" --format '{{.Manifest.Digest}}')"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Deploying $IMAGE_NAME:$TAG ($DIGEST)"
+
+      - name: Notify Discord deploy started
+        if: env.DISCORD_WEBHOOK_URL != ''
+        continue-on-error: true
+        env:
+          SHORT: ${{ steps.resolve.outputs.short }}
+        run: |
+          printf '[STARTED] Market Stream Gateway %s deploy to PROD-AMS started by %s at %s\nCommit: %s\n' \
+            "$TAG" "$GITHUB_ACTOR" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "$SHORT" \
+            | jq -Rs '{content: .}' \
+            | curl -sS -m 15 -X POST -H 'Content-Type: application/json' --data @- "$DISCORD_WEBHOOK_URL"
+
+      - name: Check deploy prerequisites on the host
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          envs: DEPLOY_DIR
+          script: |
+            set -eu
+
+            mkdir -p "$DEPLOY_DIR"
+
+            if ! docker compose version >/dev/null 2>&1; then
+              echo "Docker Compose v2 plugin is not installed on this host."
+              echo "See the README, production deployment."
+              exit 1
+            fi
+
+            # compose.prod.yaml declares this network external, so compose fails
+            # with a bare "network not found" if it is missing. Say why instead.
+            if ! docker network inspect axion-trading >/dev/null 2>&1; then
+              echo "Docker network 'axion-trading' does not exist."
+              echo "It is owned by the Trading Core deployment. On a host without"
+              echo "Core, run: docker network create axion-trading"
+              exit 1
+            fi
+
+            # This service needs no env file and no credentials, so there is
+            # nothing else to check: every provider feed it reads is public.
+
+      - name: Upload compose file
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          source: compose.prod.yaml
+          target: ${{ env.DEPLOY_DIR }}
+
+      - name: Deploy release over SSH
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
+        env:
+          DEPLOY_IMAGE: ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          envs: DEPLOY_DIR,COMPOSE_PROJECT,CONTAINER,HEALTH_URL,DEPLOY_IMAGE,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -eu
+
+            cd "$DEPLOY_DIR"
+
+            compose() {
+              docker compose -p "$COMPOSE_PROJECT" -f compose.prod.yaml "$@"
+            }
+
+            # 'docker inspect' matches any object type, so it can resolve a
+            # volume or image of the same name and return no .Config at all.
+            # Always scope container lookups explicitly.
+            PREVIOUS_IMAGE="$(docker container inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
+
+            DEPLOY_OK=0
+            SWITCHED=0
+
+            rollback() {
+              if [ -z "$PREVIOUS_IMAGE" ]; then
+                echo "No previously running image recorded; leaving the stack as it is."
+                return 0
+              fi
+              echo "Rolling back to $PREVIOUS_IMAGE"
+              printf 'MARKET_GATEWAY_IMAGE=%s\n' "$PREVIOUS_IMAGE" > .env
+              compose up -d --force-recreate
+            }
+            finish() {
+              code=$?
+              if [ "$DEPLOY_OK" -eq 0 ] && [ "$SWITCHED" -eq 1 ]; then
+                rollback || true
+              fi
+              # Registry auth is ephemeral by design; never leave it behind.
+              # The trap is not cleared on success, or this would be skipped.
+              docker logout ghcr.io >/dev/null 2>&1 || true
+              exit "$code"
+            }
+            trap finish 0
+
+            # The job token expires when this run ends, so the host stores no
+            # standing registry credential.
+            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
+
+            if ! docker pull "$DEPLOY_IMAGE" >/dev/null; then
+              echo "Cannot pull $DEPLOY_IMAGE."
+              echo "Check that CI published the image and that the GHCR package is"
+              echo "linked to this repository."
+              exit 1
+            fi
+
+            # A container left over from outside compose would hold the name.
+            if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+              OWNER="$(docker container inspect "$CONTAINER" --format '{{index .Config.Labels "com.docker.compose.project"}}')"
+              if [ -z "$OWNER" ]; then
+                echo "Removing unmanaged container '$CONTAINER' so compose can own the name."
+                docker rm -f "$CONTAINER" >/dev/null
+              fi
+            fi
+
+            # Written before any compose call: compose interpolates the whole
+            # .env file up front, so a pin written afterwards would leave the
+            # first invocation with no image reference at all.
+            printf 'MARKET_GATEWAY_IMAGE=%s\n' "$DEPLOY_IMAGE" > .env
+            SWITCHED=1
+
+            # Always recreate: a redeploy of an unchanged image must still
+            # restart the process, and it guarantees the checks below observe
+            # this run's container rather than the previous one.
+            compose up -d --force-recreate
+
+            test "$(docker container inspect -f '{{.Config.Image}}' "$CONTAINER")" = "$DEPLOY_IMAGE"
+
+            # The image healthcheck polls /health/ready, which returns 200 only
+            # once every enabled provider's catalogue has refreshed successfully
+            # and no demanded endpoint is disconnected.
+            READY=0
+            for _ in $(seq 1 40); do
+              sleep 3
+              STATE="$(docker container inspect -f '{{.State.Health.Status}}' "$CONTAINER" 2>/dev/null)" || STATE=""
+              if [ "$STATE" = "healthy" ]; then
+                READY=1
+                break
+              fi
+            done
+            if [ "$READY" -ne 1 ]; then
+              echo "$CONTAINER did not become healthy within 120s. Recent logs:"
+              docker logs --tail 50 "$CONTAINER" 2>&1 || true
+              exit 1
+            fi
+
+            # Prove the published port actually answers from the host. A process
+            # bound to container loopback passes its own in-container healthcheck
+            # while every external reader gets a reset, so health alone is not
+            # evidence that the mapping works. The || fallback is outside the
+            # substitution on purpose: inside it, curl's own output would be
+            # concatenated with the fallback and never compare equal.
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL")" || CODE="000"
+            if [ "$CODE" != "200" ]; then
+              echo "Published port did not return 200 for $HEALTH_URL (got $CODE)."
+              curl -s --max-time 5 "$HEALTH_URL" || true
+              exit 1
+            fi
+
+            test "$(docker container inspect -f '{{.RestartCount}}' "$CONTAINER")" = "0"
+
+            echo "Catalogue status:"
+            curl -s --max-time 5 http://127.0.0.1:18070/v1/catalog/status || true
+            echo
+
+            # The trap stays armed so the exit path always drops the registry
+            # login. finish() keys the rollback off DEPLOY_OK, so clearing the
+            # trap here would only skip the logout.
+            DEPLOY_OK=1
+
+            # Keep the deployed release and the two before it, three in total.
+            # docker rmi refuses to remove an image any container still uses, so
+            # a running or rollback tag can never be pulled out from under the
+            # stack even if it sorts as old. Only this repository's own images
+            # are considered; base images are never touched.
+            IMAGE_REPO="${DEPLOY_IMAGE%:*}"
+            docker images --filter "reference=$IMAGE_REPO" \
+              --format '{{.CreatedAt}}|{{.Repository}}:{{.Tag}}' \
+              | sort -r \
+              | tail -n +4 \
+              | cut -d'|' -f2 \
+              | while read -r stale; do
+                  [ -n "$stale" ] || continue
+                  if docker rmi "$stale" >/dev/null 2>&1; then
+                    echo "removed superseded image $stale"
+                  else
+                    echo "kept $stale (still in use)"
+                  fi
+                done
+
+            # Untagged leftovers from the pull.
+            docker image prune -f >/dev/null 2>&1 || true
+
+            echo "Deployed $DEPLOY_IMAGE"
+
+      - name: Notify Discord deploy succeeded
+        if: success() && env.DISCORD_WEBHOOK_URL != ''
+        continue-on-error: true
+        env:
+          SHORT: ${{ steps.resolve.outputs.short }}
+          DIGEST: ${{ steps.promote.outputs.digest }}
+        run: |
+          printf '[FINISHED] Market Stream Gateway %s deploy to PROD-AMS finished successfully at %s\nCommit: %s\nImage: %s\n' \
+            "$TAG" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "$SHORT" "$DIGEST" \
+            | jq -Rs '{content: .}' \
+            | curl -sS -m 15 -X POST -H 'Content-Type: application/json' --data @- "$DISCORD_WEBHOOK_URL"
+
+      - name: Notify Discord deploy failed
+        if: failure() && env.DISCORD_WEBHOOK_URL != ''
+        continue-on-error: true
+        run: |
+          printf '[FAILED] Market Stream Gateway %s deploy to PROD-AMS failed at %s\n' \
+            "$TAG" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
+            | jq -Rs '{content: .}' \
+            | curl -sS -m 15 -X POST -H 'Content-Type: application/json' --data @- "$DISCORD_WEBHOOK_URL"
+
+      - name: Notify Discord deploy cancelled
+        if: cancelled() && env.DISCORD_WEBHOOK_URL != ''
+        continue-on-error: true
+        run: |
+          printf '[CANCELLED] Market Stream Gateway %s deploy to PROD-AMS was cancelled at %s\n' \
+            "$TAG" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
+            | jq -Rs '{content: .}' \
+            | curl -sS -m 15 -X POST -H 'Content-Type: application/json' --data @- "$DISCORD_WEBHOOK_URL"

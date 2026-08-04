@@ -1,10 +1,15 @@
 name: ci
 
+# Pushes never deploy. Merging to main validates the change and publishes an
+# immutable image tagged with the commit SHA; publishing a GitHub Release then
+# deploys that already-tested image (see release.yml).
+#
+# `push` is restricted to main on purpose. Listening on every branch ran the
+# whole suite twice for each pull-request push, once per event.
 on:
-  pull_request:
   push:
-    branches:
-      - "**"
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
@@ -15,6 +20,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  IMAGE_NAME: ghcr.io/kutpat/market-stream-gateway
 
 jobs:
   rust:
@@ -43,6 +49,9 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -81,3 +90,28 @@ jobs:
             sleep 1
           done
           exit 1
+
+      # Only a push to main publishes. A pull request, including one from a
+      # fork, never reaches this step and never needs registry write access.
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # release.yml resolves a release tag to its commit and looks the image up
+      # by full SHA, so that tag is the contract between the two workflows. The
+      # image pushed here is the one smoke tested above, retagged rather than
+      # rebuilt.
+      - name: Push image
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag market-stream-gateway:test "$IMAGE_NAME:sha-$GITHUB_SHA"
+          docker tag market-stream-gateway:test "$IMAGE_NAME:main"
+          docker push "$IMAGE_NAME:sha-$GITHUB_SHA"
+          docker push "$IMAGE_NAME:main"
+          echo "published $IMAGE_NAME:sha-$GITHUB_SHA"
