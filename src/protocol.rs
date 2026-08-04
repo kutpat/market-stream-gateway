@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{SCHEMA_VERSION, Subscription, SubscriptionKey};
+use crate::domain::{Provider, SCHEMA_VERSION, Subscription, SubscriptionKey};
+use crate::gateway::ProviderLimits;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -35,7 +38,15 @@ pub enum ControlMessage {
         schema_version: u16,
         stream_epoch: String,
         max_subscriptions: usize,
+        /// The ceiling that is safe to apply uniformly to every provider.
+        ///
+        /// Retained so a client that predates `provider_subscription_limits`
+        /// still cannot oversubscribe the strictest venue. It is the minimum of
+        /// the per-provider limits, so it understates capacity for permissive
+        /// venues; prefer the map below.
         max_provider_subscriptions: usize,
+        /// Exact ceiling per enabled provider.
+        provider_subscription_limits: BTreeMap<Provider, usize>,
     },
     Ack {
         schema_version: u16,
@@ -65,13 +76,14 @@ impl ControlMessage {
     pub fn hello(
         stream_epoch: impl Into<String>,
         max_subscriptions: usize,
-        max_provider_subscriptions: usize,
+        provider_limits: &ProviderLimits,
     ) -> Self {
         Self::Hello {
             schema_version: SCHEMA_VERSION,
             stream_epoch: stream_epoch.into(),
             max_subscriptions,
-            max_provider_subscriptions,
+            max_provider_subscriptions: provider_limits.minimum(),
+            provider_subscription_limits: provider_limits.entries().clone(),
         }
     }
 
@@ -110,10 +122,25 @@ mod tests {
 
     #[test]
     fn control_messages_carry_schema_version() {
-        let message = ControlMessage::hello("epoch", 100, 50);
+        let message = ControlMessage::hello("epoch", 100, &ProviderLimits::uniform(50));
         let value = serde_json::to_value(message).unwrap();
         assert_eq!(value["type"], "hello");
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
         assert_eq!(value["max_provider_subscriptions"], 50);
+    }
+
+    #[test]
+    fn hello_advertises_per_provider_limits_and_a_safe_uniform_scalar() {
+        let limits = ProviderLimits::new(
+            BTreeMap::from([(Provider::Bybit, 1_000), (Provider::Bingx, 200)]),
+            1_000,
+        );
+        let value = serde_json::to_value(ControlMessage::hello("epoch", 512, &limits)).unwrap();
+
+        assert_eq!(value["provider_subscription_limits"]["bybit"], 1_000);
+        assert_eq!(value["provider_subscription_limits"]["bingx"], 200);
+        // The scalar is the minimum, so a client that only reads it cannot
+        // oversubscribe the strictest venue.
+        assert_eq!(value["max_provider_subscriptions"], 200);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use uuid::Uuid;
 
-use crate::domain::{MarketEvent, ProviderEvent, SubscriptionKey};
+use crate::domain::{MarketEvent, Provider, ProviderEvent, SubscriptionKey};
 
 /// A stable identity for one connected downstream client.
 pub type ClientId = Uuid;
@@ -324,10 +324,67 @@ pub enum RegistryError {
         "provider subscription limit exceeded for {provider}: requested {requested}, maximum is {limit}"
     )]
     ProviderLimitExceeded {
-        provider: crate::domain::Provider,
+        provider: Provider,
         limit: usize,
         requested: usize,
     },
+}
+
+/// Per-provider channel-subscription ceilings.
+///
+/// A single uniform ceiling cannot describe six venues: some document a
+/// per-connection topic limit and some do not, so one global number is either
+/// too low for the permissive venues or unsafe for the strict ones. Each
+/// provider therefore contributes its own ceiling from
+/// [`ProviderAdapter::max_subscriptions`](crate::providers::ProviderAdapter::max_subscriptions).
+#[derive(Debug, Clone)]
+pub struct ProviderLimits {
+    limits: BTreeMap<Provider, usize>,
+    fallback: usize,
+}
+
+impl ProviderLimits {
+    pub fn new(limits: BTreeMap<Provider, usize>, fallback: usize) -> Self {
+        Self { limits, fallback }
+    }
+
+    /// One ceiling applied to every provider.
+    pub fn uniform(limit: usize) -> Self {
+        Self {
+            limits: BTreeMap::new(),
+            fallback: limit,
+        }
+    }
+
+    /// Tighten every ceiling to at most `ceiling`.
+    ///
+    /// An operator may lower a limit but never raise it past what the provider
+    /// declared, because the declared value can be a venue rule.
+    #[must_use]
+    pub fn capped_at(mut self, ceiling: usize) -> Self {
+        for limit in self.limits.values_mut() {
+            *limit = (*limit).min(ceiling);
+        }
+        self.fallback = self.fallback.min(ceiling);
+        self
+    }
+
+    pub fn limit_for(&self, provider: Provider) -> usize {
+        self.limits.get(&provider).copied().unwrap_or(self.fallback)
+    }
+
+    /// The ceiling that is safe for a client to apply uniformly to any provider.
+    ///
+    /// This is what the `hello` frame's scalar `max_provider_subscriptions`
+    /// reports, so a client that ignores the per-provider map still cannot
+    /// oversubscribe the strictest venue.
+    pub fn minimum(&self) -> usize {
+        self.limits.values().copied().min().unwrap_or(self.fallback)
+    }
+
+    pub fn entries(&self) -> &BTreeMap<Provider, usize> {
+        &self.limits
+    }
 }
 
 #[derive(Debug, Default)]
@@ -341,7 +398,7 @@ struct RegistryState {
 #[derive(Debug)]
 pub struct SubscriptionRegistry {
     max_subscriptions_per_client: usize,
-    max_subscriptions_per_provider: usize,
+    provider_limits: ProviderLimits,
     state: Mutex<RegistryState>,
     desired: watch::Sender<DesiredSubscriptions>,
 }
@@ -355,10 +412,20 @@ impl SubscriptionRegistry {
         max_subscriptions_per_client: usize,
         max_subscriptions_per_provider: usize,
     ) -> Self {
+        Self::with_provider_limits(
+            max_subscriptions_per_client,
+            ProviderLimits::uniform(max_subscriptions_per_provider),
+        )
+    }
+
+    pub fn with_provider_limits(
+        max_subscriptions_per_client: usize,
+        provider_limits: ProviderLimits,
+    ) -> Self {
         let (desired, _) = watch::channel(Arc::new(BTreeSet::new()));
         Self {
             max_subscriptions_per_client,
-            max_subscriptions_per_provider,
+            provider_limits,
             state: Mutex::new(RegistryState::default()),
             desired,
         }
@@ -368,8 +435,13 @@ impl SubscriptionRegistry {
         self.max_subscriptions_per_client
     }
 
+    /// The ceiling safe to apply to any provider, for the `hello` scalar.
     pub fn max_subscriptions_per_provider(&self) -> usize {
-        self.max_subscriptions_per_provider
+        self.provider_limits.minimum()
+    }
+
+    pub fn provider_limits(&self) -> &ProviderLimits {
+        &self.provider_limits
     }
 
     /// Subscribe to the latest complete desired-state snapshot.
@@ -428,13 +500,16 @@ impl SubscriptionRegistry {
                 *total = total.saturating_add(1);
             }
         }
+        // Each provider is checked against its own ceiling: a permissive venue
+        // must not be held to the strictest one, and a strict venue must not
+        // inherit a permissive limit.
         if let Some((provider, requested)) = provider_totals
             .into_iter()
-            .find(|(_, total)| *total > self.max_subscriptions_per_provider)
+            .find(|(provider, total)| *total > self.provider_limits.limit_for(*provider))
         {
             return Err(RegistryError::ProviderLimitExceeded {
                 provider,
-                limit: self.max_subscriptions_per_provider,
+                limit: self.provider_limits.limit_for(provider),
                 requested,
             });
         }
@@ -602,6 +677,9 @@ mod tests {
 
     use super::*;
     use crate::domain::{Channel, MarketKind, MarketPayload, ObservedDecimal, Provider, Ticker};
+
+    /// Stand-in for the capacity of a provider absent from an explicit map.
+    const DEFAULT_PROVIDER_FALLBACK: usize = 1_000;
 
     fn key(provider: Provider, symbol: &str, channel: Channel) -> SubscriptionKey {
         SubscriptionKey::new(provider, MarketKind::LinearPerpetual, symbol, channel).unwrap()
@@ -841,6 +919,89 @@ mod tests {
             &BTreeSet::from([ticker.clone()])
         );
         assert!(!registry.desired_snapshot().contains(&candle));
+    }
+
+    #[tokio::test]
+    async fn a_permissive_provider_is_not_held_to_the_strictest_provider_limit() {
+        // A Trading Core worker route uses two channels, so 42 streamed symbols
+        // is 84 channel subscriptions on one provider. The previous single
+        // ceiling of 60 rejected that outright and no configuration could raise
+        // it, because validation compared against a compile-time constant.
+        let limits = ProviderLimits::new(
+            BTreeMap::from([(Provider::Bybit, 1_000), (Provider::Bingx, 200)]),
+            DEFAULT_PROVIDER_FALLBACK,
+        );
+        let registry = SubscriptionRegistry::with_provider_limits(512, limits);
+        let client = Uuid::new_v4();
+
+        let worker_routes = (0..42)
+            .flat_map(|index| {
+                let symbol = format!("SYM{index}USDT");
+                [
+                    key(Provider::Bybit, &symbol, Channel::Ticker),
+                    key(Provider::Bybit, &symbol, Channel::Candle1m),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(worker_routes.len(), 84);
+
+        let change = registry.add(client, worker_routes).await.unwrap();
+        assert_eq!(change.added.len(), 84);
+    }
+
+    #[tokio::test]
+    async fn a_strict_provider_keeps_its_own_documented_ceiling() {
+        let limits = ProviderLimits::new(
+            BTreeMap::from([(Provider::Bybit, 1_000), (Provider::Bingx, 2)]),
+            DEFAULT_PROVIDER_FALLBACK,
+        );
+        let registry = SubscriptionRegistry::with_provider_limits(512, limits);
+        let client = Uuid::new_v4();
+
+        // Bybit's permissive ceiling must not leak into BingX.
+        registry
+            .add(client, [key(Provider::Bingx, "BTC-USDT", Channel::Ticker)])
+            .await
+            .unwrap();
+        let error = registry
+            .add(
+                client,
+                [
+                    key(Provider::Bingx, "BTC-USDT", Channel::Candle1m),
+                    key(Provider::Bingx, "ETH-USDT", Channel::Ticker),
+                ],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            RegistryError::ProviderLimitExceeded {
+                provider: Provider::Bingx,
+                limit: 2,
+                requested: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn an_operator_ceiling_tightens_but_never_raises_a_declared_limit() {
+        let limits = ProviderLimits::new(
+            BTreeMap::from([(Provider::Bybit, 1_000), (Provider::Bingx, 200)]),
+            DEFAULT_PROVIDER_FALLBACK,
+        )
+        .capped_at(150);
+
+        assert_eq!(limits.limit_for(Provider::Bybit), 150);
+        // Already stricter than the operator ceiling, so the venue rule stands.
+        assert_eq!(limits.limit_for(Provider::Bingx), 150);
+        assert_eq!(
+            ProviderLimits::new(BTreeMap::from([(Provider::Bingx, 200)]), 1_000)
+                .capped_at(5_000)
+                .limit_for(Provider::Bingx),
+            200,
+            "an operator ceiling above the declared limit must not raise it"
+        );
     }
 
     #[tokio::test]

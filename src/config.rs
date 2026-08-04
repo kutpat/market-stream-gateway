@@ -7,8 +7,6 @@ use url::Url;
 
 use crate::domain::Provider;
 
-pub const MAX_SAFE_PROVIDER_SUBSCRIPTIONS: usize = 60;
-
 #[derive(Debug, Clone, Parser)]
 #[command(name = "market-stream-gateway", version, about)]
 pub struct Settings {
@@ -27,12 +25,13 @@ pub struct Settings {
     #[arg(long, env = "MSG_MAX_CLIENT_SUBSCRIPTIONS", default_value_t = 512)]
     pub max_client_subscriptions: usize,
 
-    #[arg(
-        long,
-        env = "MSG_MAX_PROVIDER_SUBSCRIPTIONS",
-        default_value_t = MAX_SAFE_PROVIDER_SUBSCRIPTIONS
-    )]
-    pub max_provider_subscriptions: usize,
+    /// Optional ceiling applied on top of every provider's declared capacity.
+    ///
+    /// Unset means each provider uses its own declared capacity. A value only
+    /// ever tightens a limit: it cannot raise one past what the provider
+    /// declared, because that declaration can be a venue rule.
+    #[arg(long, env = "MSG_MAX_PROVIDER_SUBSCRIPTIONS")]
+    pub max_provider_subscriptions: Option<usize>,
 
     #[arg(long, env = "MSG_MAX_COMMAND_BYTES", default_value_t = 65_536)]
     pub max_command_bytes: usize,
@@ -168,12 +167,8 @@ impl Settings {
         if self.max_client_subscriptions == 0 {
             return Err("max client subscriptions must be greater than zero".to_owned());
         }
-        if self.max_provider_subscriptions == 0
-            || self.max_provider_subscriptions > MAX_SAFE_PROVIDER_SUBSCRIPTIONS
-        {
-            return Err(format!(
-                "max provider subscriptions must be between 1 and {MAX_SAFE_PROVIDER_SUBSCRIPTIONS}"
-            ));
+        if self.max_provider_subscriptions == Some(0) {
+            return Err("max provider subscriptions must be greater than zero".to_owned());
         }
         if self.max_command_bytes == 0 {
             return Err("max command bytes must be greater than zero".to_owned());
@@ -322,10 +317,9 @@ mod tests {
         let settings = Settings::try_parse_from(["gateway"]).unwrap();
         assert_eq!(settings.bind, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(settings.downstream_buffer, 4096);
-        assert_eq!(
-            settings.max_provider_subscriptions,
-            MAX_SAFE_PROVIDER_SUBSCRIPTIONS
-        );
+        // Unset by default: each provider contributes its own declared capacity
+        // instead of one global ceiling.
+        assert_eq!(settings.max_provider_subscriptions, None);
         assert!(settings.validate().is_ok());
         assert_eq!(settings.binance_ws_url.path(), "/market/ws");
         assert_eq!(settings.enabled_providers().len(), 6);
@@ -335,6 +329,20 @@ mod tests {
     fn invalid_limits_are_rejected() {
         let settings = Settings::try_parse_from(["gateway", "--downstream-buffer", "0"]).unwrap();
         assert!(settings.validate().is_err());
+        let zero_provider_limit =
+            Settings::try_parse_from(["gateway", "--max-provider-subscriptions", "0"]).unwrap();
+        assert!(zero_provider_limit.validate().is_err());
+    }
+
+    #[test]
+    fn provider_subscription_override_is_accepted_above_the_previous_hard_ceiling() {
+        // The limit used to be validated against a compile-time constant of 60,
+        // which no configuration could exceed. A single Trading Core worker needs
+        // more than that on one provider.
+        let settings =
+            Settings::try_parse_from(["gateway", "--max-provider-subscriptions", "400"]).unwrap();
+        assert_eq!(settings.max_provider_subscriptions, Some(400));
+        assert!(settings.validate().is_ok());
     }
 
     #[test]

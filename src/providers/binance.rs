@@ -68,6 +68,13 @@ impl ProviderAdapter for BinanceAdapter {
         EndpointKind::Primary
     }
 
+    fn max_subscriptions(&self) -> usize {
+        // Conservative: the documented stream batch bound is the tightest limit
+        // this repository has verified for Binance, so it is reused as the
+        // provider ceiling rather than assuming a larger per-connection budget.
+        BINANCE_MAX_STREAMS_PER_COMMAND
+    }
+
     async fn connection_target(
         &self,
         endpoint: EndpointKind,
