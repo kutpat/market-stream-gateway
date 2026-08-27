@@ -1,10 +1,10 @@
 [package]
 name = "market-stream-gateway"
-version = "0.1.0"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.97"
 description = "Provider-neutral cryptocurrency market stream gateway"
-license = "UNLICENSED"
+license = "MIT"
 publish = false
 # Without this, the healthcheck binary makes `cargo run` ambiguous and every
 # documented run command fails before it starts.

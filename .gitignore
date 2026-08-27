@@ -1,7 +1,11 @@
 /target/
-/docs/
+/docs/*
+!/docs/protocol.md
+!/docs/providers.md
 /.idea/
 /.vscode/
 /.env
 *.log
 coverage/
+AGENTS.md
+CLAUDE.md
