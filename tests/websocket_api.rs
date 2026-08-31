@@ -35,6 +35,7 @@ async fn websocket_subscriptions_receive_only_matching_normalized_events() {
         enabled_providers: Arc::new(BTreeSet::from([Provider::Bybit])),
         allowed_origins: Arc::new(BTreeSet::new()),
         max_command_bytes: 4096,
+        catalog_on_demand_cooldown: Duration::from_mins(1),
         shutdown: tokio_util::sync::CancellationToken::new(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

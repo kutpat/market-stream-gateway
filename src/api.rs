@@ -40,6 +40,7 @@ pub struct AppState {
     pub enabled_providers: Arc<BTreeSet<Provider>>,
     pub allowed_origins: Arc<BTreeSet<String>>,
     pub max_command_bytes: usize,
+    pub catalog_on_demand_cooldown: Duration,
     pub shutdown: CancellationToken,
 }
 
@@ -121,14 +122,29 @@ async fn instruments(
     State(state): State<AppState>,
     Query(query): Query<InstrumentQuery>,
 ) -> Json<Vec<crate::catalog::Instrument>> {
-    Json(state.catalog.filter(&CatalogFilter {
+    let filter = CatalogFilter {
         provider: query.provider,
         market: query.market,
         symbol: query.symbol,
         base_asset: query.base_asset,
         quote_asset: query.quote_asset,
         settle_asset: query.settle_asset,
-    }))
+    };
+    let instruments = state.catalog.filter(&filter);
+    if !instruments.is_empty() || filter.symbol.is_none() {
+        return Json(instruments);
+    }
+    // A named symbol that no snapshot knows is most often a listing newer than the last
+    // scheduled refresh. Read through to the upstream once, under a cooldown, rather than
+    // reporting it absent until the next sweep hours later.
+    if state
+        .catalog
+        .fill_missing_symbol(filter.provider, state.catalog_on_demand_cooldown)
+        .await
+    {
+        return Json(state.catalog.filter(&filter));
+    }
+    Json(instruments)
 }
 
 async fn catalog_status(State(state): State<AppState>) -> Json<Vec<ProviderCatalogStatus>> {
@@ -714,6 +730,7 @@ mod tests {
             ])),
             allowed_origins: Arc::new(BTreeSet::new()),
             max_command_bytes: 1024,
+            catalog_on_demand_cooldown: Duration::from_mins(1),
             shutdown: CancellationToken::new(),
         }
     }

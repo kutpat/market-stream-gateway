@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         enabled_providers: Arc::new(enabled_providers),
         allowed_origins: Arc::new(settings.allowed_origins.iter().cloned().collect()),
         max_command_bytes: settings.max_command_bytes,
+        catalog_on_demand_cooldown: settings.catalog_on_demand_cooldown(),
         shutdown: shutdown.clone(),
     };
     let listener = TcpListener::bind(settings.bind)

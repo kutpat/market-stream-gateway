@@ -62,6 +62,16 @@ pub struct Settings {
     #[arg(long, env = "MSG_CATALOG_REFRESH_SECONDS", default_value_t = 21_600)]
     pub catalog_refresh_seconds: u64,
 
+    /// Shortest gap between upstream catalog reads triggered by a request for an unknown symbol.
+    ///
+    /// Zero disables read-through entirely, leaving only the scheduled refresh.
+    #[arg(
+        long,
+        env = "MSG_CATALOG_ON_DEMAND_COOLDOWN_SECONDS",
+        default_value_t = 60
+    )]
+    pub catalog_on_demand_cooldown_seconds: u64,
+
     #[arg(
         long,
         env = "MSG_BYBIT_WS_URL",
@@ -251,6 +261,10 @@ impl Settings {
 
     pub fn catalog_refresh_interval(&self) -> Duration {
         Duration::from_secs(self.catalog_refresh_seconds)
+    }
+
+    pub fn catalog_on_demand_cooldown(&self) -> Duration {
+        Duration::from_secs(self.catalog_on_demand_cooldown_seconds)
     }
 
     pub fn enabled_providers(&self) -> BTreeSet<Provider> {
