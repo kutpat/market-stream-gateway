@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::join_all;
 use reqwest::Client;
@@ -424,6 +424,66 @@ impl Catalog {
                 Err(error)
             }
         }
+    }
+
+    /// Refresh a provider only if its last attempt is older than `cooldown`.
+    ///
+    /// Returns `None` when the cooldown suppressed the attempt. The cooldown is measured from
+    /// the last *attempt* rather than the last success, so a provider that keeps failing is
+    /// throttled just as firmly as one that keeps succeeding.
+    async fn refresh_provider_after_cooldown(
+        &self,
+        provider: Provider,
+        cooldown: Duration,
+    ) -> Option<Result<RefreshOutcome, CatalogError>> {
+        if !self.sources.is_enabled(provider) {
+            return None;
+        }
+        let cooldown_ms = u64::try_from(cooldown.as_millis()).unwrap_or(u64::MAX);
+        let last_attempt_at_ms = read_lock(&self.state)
+            .providers
+            .get(&provider)
+            .and_then(|snapshot| snapshot.status.last_attempt_at_ms);
+        if let Some(last_attempt_at_ms) = last_attempt_at_ms
+            && unix_time_ms().saturating_sub(last_attempt_at_ms) < cooldown_ms
+        {
+            return None;
+        }
+        Some(self.refresh_provider(provider).await)
+    }
+
+    /// Fill a catalog miss for a named symbol, so a fresh listing need not wait for the
+    /// scheduled sweep.
+    ///
+    /// An instrument listed minutes ago is absent from every snapshot taken before it existed,
+    /// leaving consumers unable to resolve it for the rest of the refresh interval. Reading
+    /// through on the first request for an unknown symbol closes that window for all of them at
+    /// once. `provider` narrows the work when the caller already knows the venue.
+    ///
+    /// A zero `cooldown` turns read-through off, leaving only the scheduled refresh.
+    ///
+    /// Returns `true` when at least one provider snapshot was actually replaced, meaning the
+    /// caller should consult the catalog again.
+    pub async fn fill_missing_symbol(
+        &self,
+        provider: Option<Provider>,
+        cooldown: Duration,
+    ) -> bool {
+        if cooldown.is_zero() {
+            return false;
+        }
+        let providers: Vec<Provider> = match provider {
+            Some(provider) => vec![provider],
+            None => self.enabled_providers().into_iter().collect(),
+        };
+        let results = join_all(providers.into_iter().map(|provider| async move {
+            self.refresh_provider_after_cooldown(provider, cooldown)
+                .await
+        }))
+        .await;
+        results
+            .into_iter()
+            .any(|outcome| matches!(outcome, Some(Ok(_))))
     }
 
     /// Refresh all enabled providers concurrently and report each result independently.
@@ -2210,6 +2270,150 @@ mod tests {
             .into_response()
         } else {
             (StatusCode::SERVICE_UNAVAILABLE, "temporary failure").into_response()
+        }
+    }
+
+    #[tokio::test]
+    async fn on_demand_fill_sees_a_listing_newer_than_the_last_refresh() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/", get(growing_bybit))
+            .with_state(Arc::clone(&calls));
+        let (url, server) = spawn_server(router).await;
+        let catalog = bybit_catalog(url);
+
+        catalog.refresh_provider(Provider::Bybit).await.unwrap();
+        // The snapshot was taken before the listing existed.
+        assert!(
+            catalog
+                .get(Provider::Bybit, MarketKind::LinearPerpetual, "NEWUSDT")
+                .is_none()
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let filled = catalog
+            .fill_missing_symbol(Some(Provider::Bybit), Duration::from_millis(1))
+            .await;
+
+        assert!(filled);
+        assert!(
+            catalog
+                .get(Provider::Bybit, MarketKind::LinearPerpetual, "NEWUSDT")
+                .is_some()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn on_demand_fill_is_throttled_by_the_cooldown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/", get(growing_bybit))
+            .with_state(Arc::clone(&calls));
+        let (url, server) = spawn_server(router).await;
+        let catalog = bybit_catalog(url);
+
+        catalog.refresh_provider(Provider::Bybit).await.unwrap();
+        let after_first = calls.load(Ordering::SeqCst);
+
+        // A symbol nothing will ever list must not read through on every request.
+        assert!(
+            !catalog
+                .fill_missing_symbol(Some(Provider::Bybit), Duration::from_hours(1))
+                .await
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), after_first);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_zero_cooldown_turns_read_through_off() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/", get(growing_bybit))
+            .with_state(Arc::clone(&calls));
+        let (url, server) = spawn_server(router).await;
+        let catalog = bybit_catalog(url);
+
+        assert!(
+            !catalog
+                .fill_missing_symbol(Some(Provider::Bybit), Duration::ZERO)
+                .await
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn on_demand_fill_leaves_a_disabled_provider_alone() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/", get(growing_bybit))
+            .with_state(Arc::clone(&calls));
+        let (url, server) = spawn_server(router).await;
+        let catalog = bybit_catalog(url);
+
+        // Only Bybit is enabled in this fixture, so Binance must never be contacted.
+        assert!(
+            catalog
+                .refresh_provider_after_cooldown(Provider::Binance, Duration::from_millis(1))
+                .await
+                .is_none()
+        );
+        assert!(
+            !catalog
+                .fill_missing_symbol(Some(Provider::Binance), Duration::from_millis(1))
+                .await
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failing_read_through_retains_the_previous_snapshot() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/", get(flaky_bybit))
+            .with_state(Arc::clone(&calls));
+        let (url, server) = spawn_server(router).await;
+        let catalog = bybit_catalog(url);
+
+        catalog.refresh_provider(Provider::Bybit).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert!(
+            !catalog
+                .fill_missing_symbol(Some(Provider::Bybit), Duration::from_millis(1))
+                .await
+        );
+
+        // The good snapshot survives a failed read-through, and the error is recorded.
+        assert!(
+            catalog
+                .get(Provider::Bybit, MarketKind::LinearPerpetual, "BTCUSDT")
+                .is_some()
+        );
+        assert!(catalog.status(Provider::Bybit).last_error.is_some());
+        server.abort();
+    }
+
+    async fn growing_bybit(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
+        // The first sweep predates the listing; every later read sees it.
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Json(bybit_payload(
+                &[bybit_item("BTCUSDT", "LinearPerpetual", "Trading")],
+                "",
+            ))
+        } else {
+            Json(bybit_payload(
+                &[
+                    bybit_item("BTCUSDT", "LinearPerpetual", "Trading"),
+                    bybit_item("NEWUSDT", "LinearPerpetual", "Trading"),
+                ],
+                "",
+            ))
         }
     }
 
