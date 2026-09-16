@@ -329,9 +329,13 @@ fn init_logging(format: LogFormat) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("market_stream_gateway=info,tower_http=info"));
     match format {
+        // flatten_event lifts the message and its fields to the top level.
+        // Without it tracing nests them under "fields", so a fleet-wide query
+        // for `message` finds every service except this one.
         LogFormat::Json => tracing_subscriber::fmt()
             .with_env_filter(filter)
             .json()
+            .flatten_event(true)
             .init(),
         LogFormat::Pretty => tracing_subscriber::fmt()
             .with_env_filter(filter)
