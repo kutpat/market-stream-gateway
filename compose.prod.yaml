@@ -61,6 +61,7 @@ services:
       # contract_size. Re-enable it in the same commit that gives Core that
       # support, not before.
       MSG_PROVIDERS: bybit,binance
+      MSG_CATALOG_REFRESH_SECONDS: 900
       # Browser origins stay denied: MSG_ALLOWED_ORIGINS is deliberately unset.
     healthcheck:
       test: ["CMD", "/usr/local/bin/market-stream-healthcheck"]
